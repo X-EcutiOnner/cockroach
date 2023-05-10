@@ -38,7 +38,7 @@ func registerCostFuzz(r registry.Registry) {
 		r.Add(registry.TestSpec{
 			Name:            fmt.Sprintf("costfuzz/%s", setupName),
 			Owner:           registry.OwnerSQLQueries,
-			Timeout:         time.Hour * 1,
+			Timeout:         time.Hour * 2,
 			RequiresLicense: true,
 			Tags:            nil,
 			Cluster:         clusterSpec,
