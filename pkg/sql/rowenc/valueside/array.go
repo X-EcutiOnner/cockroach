@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package valueside
 
@@ -14,10 +9,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/tsearch"
+	"github.com/cockroachdb/cockroach/pkg/util/vector"
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/redact"
 )
 
 // encodeArray produces the value encoding for an array.
@@ -191,6 +187,8 @@ func decodeArrayHeader(b []byte) (arrayHeader, []byte, error) {
 	}, b, nil
 }
 
+var errNestedArraysNotFullySupported = unimplemented.NewWithIssueDetail(32552, "", "nested arrays are not fully supported")
+
 // DatumTypeToArrayElementEncodingType decides an encoding type to
 // place in the array header given a datum type. The element encoding
 // type is then used to encode/decode array elements.
@@ -210,7 +208,8 @@ func DatumTypeToArrayElementEncodingType(t *types.T) (encoding.Type, error) {
 		return encoding.Geo, nil
 	case types.DecimalFamily:
 		return encoding.Decimal, nil
-	case types.BytesFamily, types.StringFamily, types.CollatedStringFamily, types.EnumFamily:
+	case types.BytesFamily, types.StringFamily, types.CollatedStringFamily,
+		types.EnumFamily, types.RefCursorFamily:
 		return encoding.Bytes, nil
 	case types.TimestampFamily, types.TimestampTZFamily:
 		return encoding.Time, nil
@@ -237,10 +236,10 @@ func DatumTypeToArrayElementEncodingType(t *types.T) (encoding.Type, error) {
 		return encoding.JSON, nil
 	case types.TupleFamily:
 		return encoding.Tuple, nil
+	case types.ArrayFamily:
+		return 0, errNestedArraysNotFullySupported
 	default:
-		return 0, errors.AssertionFailedf(
-			"no known encoding type for %s", redact.Safe(t.Family().Name()),
-		)
+		return 0, errors.AssertionFailedf("no known encoding type for %s", t.Family().Name())
 	}
 }
 func checkElementType(paramType *types.T, elemType *types.T) error {
@@ -318,12 +317,19 @@ func encodeArrayElement(b []byte, d tree.Datum) ([]byte, error) {
 		}
 		return encoding.EncodeUntaggedBytesValue(b, encoded), nil
 	case *tree.DTuple:
-		return encodeUntaggedTuple(t, b, encoding.NoColumnID, nil)
+		res, _, err := encodeUntaggedTuple(t, b, nil)
+		return res, err
 	case *tree.DTSQuery:
 		encoded := tsearch.EncodeTSQueryPGBinary(nil, t.TSQuery)
 		return encoding.EncodeUntaggedBytesValue(b, encoded), nil
 	case *tree.DTSVector:
 		encoded, err := tsearch.EncodeTSVector(nil, t.TSVector)
+		if err != nil {
+			return nil, err
+		}
+		return encoding.EncodeUntaggedBytesValue(b, encoded), nil
+	case *tree.DPGVector:
+		encoded, err := vector.Encode(nil, t.T)
 		if err != nil {
 			return nil, err
 		}

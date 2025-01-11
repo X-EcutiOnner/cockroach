@@ -1,10 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package changefeedccl
 
@@ -12,12 +9,14 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
+	"math/rand"
 	"net/url"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdceval"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdctest"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
@@ -25,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
@@ -39,6 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -61,7 +62,7 @@ func TestAlterChangefeedAddTargetPrivileges(t *testing.T) {
 						if _, ok := s.(*externalConnectionKafkaSink); ok {
 							return s
 						}
-						return &externalConnectionKafkaSink{sink: s}
+						return &externalConnectionKafkaSink{sink: s, ignoreDialError: true}
 					},
 				},
 			},
@@ -236,6 +237,8 @@ func TestAlterChangefeedAddTargetFamily(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	require.NoError(t, log.SetVModule("helpers_test=1"))
+
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
 		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING, FAMILY onlya (a), FAMILY onlyb (b))`)
@@ -274,6 +277,8 @@ func TestAlterChangefeedAddTargetFamily(t *testing.T) {
 func TestAlterChangefeedSwitchFamily(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
+	require.NoError(t, log.SetVModule("helpers_test=1"))
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
@@ -436,6 +441,48 @@ func TestAlterChangefeedSetDiffOption(t *testing.T) {
 		sqlDB.Exec(t, `INSERT INTO foo VALUES (0, 'initial')`)
 		assertPayloads(t, testFeed, []string{
 			`foo: [0]->{"after": {"a": 0, "b": "initial"}, "before": null}`,
+		})
+	}
+
+	cdcTest(t, testFn, feedTestEnterpriseSinks, feedTestNoExternalConnection)
+}
+
+func TestAlterChangefeedRespectsCDCQuery(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
+
+		const cdcQuery = "SELECT * FROM foo WHERE a % 2 = 0"
+		testFeed := feed(t, f, "CREATE CHANGEFEED WITH format='json', envelope='wrapped' AS "+cdcQuery)
+		defer closeFeed(t, testFeed)
+
+		feed, ok := testFeed.(cdctest.EnterpriseTestFeed)
+		require.True(t, ok)
+
+		sqlDB.Exec(t, `PAUSE JOB $1`, feed.JobID())
+		waitForJobStatus(sqlDB, t, feed.JobID(), `paused`)
+
+		sqlDB.Exec(t, fmt.Sprintf(`ALTER CHANGEFEED %d SET diff`, feed.JobID()))
+		registry := s.Server.JobRegistry().(*jobs.Registry)
+		job, err := registry.LoadJob(context.Background(), feed.JobID())
+		require.NoError(t, err)
+		details, ok := job.Details().(jobspb.ChangefeedDetails)
+		require.True(t, ok)
+
+		// Verify the query still intact.
+		sc, err := cdceval.ParseChangefeedExpression(cdcQuery)
+		require.NoError(t, err)
+		require.Equal(t, cdceval.AsStringUnredacted(sc), details.Select)
+
+		// Addition/Removal of the tables is not supported yet.
+		t.Run("cannot add or drop", func(t *testing.T) {
+			sqlDB.ExpectErr(t, "cannot modify targets when using CDC query changefeed",
+				fmt.Sprintf(`ALTER CHANGEFEED %d ADD blah SET DIFF`, feed.JobID()))
+			sqlDB.ExpectErr(t, "cannot modify targets when using CDC query changefeed",
+				fmt.Sprintf(`ALTER CHANGEFEED %d DROP blah SET DIFF`, feed.JobID()))
 		})
 	}
 
@@ -664,19 +711,26 @@ func TestAlterChangefeedPersistSinkURI(t *testing.T) {
 
 	const unredactedSinkURI = "null://blah?AWS_ACCESS_KEY_ID=the_secret"
 
-	s, rawSQLDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
-	sqlDB := sqlutils.MakeSQLRunner(rawSQLDB)
-	registry := s.ApplicationLayer().JobRegistry().(*jobs.Registry)
 	ctx := context.Background()
-	defer s.Stopper().Stop(ctx)
+	srv, rawSQLDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+		},
+	})
+	defer srv.Stopper().Stop(ctx)
+
+	s := srv.ApplicationLayer()
+	sqlDB := sqlutils.MakeSQLRunner(rawSQLDB)
+	registry := s.JobRegistry().(*jobs.Registry)
+
+	for _, l := range []serverutils.ApplicationLayerInterface{s, srv.SystemLayer()} {
+		kvserver.RangefeedEnabled.Override(ctx, &l.ClusterSettings().SV, true)
+	}
 
 	query := `CREATE TABLE foo (a string)`
 	sqlDB.Exec(t, query)
 
 	query = `CREATE TABLE bar (b string)`
-	sqlDB.Exec(t, query)
-
-	query = `SET CLUSTER SETTING kv.rangefeed.enabled = true`
 	sqlDB.Exec(t, query)
 
 	var changefeedID jobspb.JobID
@@ -1158,21 +1212,17 @@ func TestAlterChangefeedAddTargetsDuringSchemaChangeError(t *testing.T) {
 		}()
 
 		// Ensure initial backfill completes
-		testutils.SucceedsSoon(t, func() error {
-			prog := loadProgress(t, jobFeed, jobRegistry)
-			if p := prog.GetHighWater(); p != nil && !p.IsEmpty() {
-				return nil
-			}
-			return errors.New("waiting for highwater")
-		})
+		waitForHighwater(t, jobFeed, jobRegistry)
 
 		// Pause job and setup overrides to force a checkpoint
 		require.NoError(t, jobFeed.Pause())
 
 		var maxCheckpointSize int64 = 100 << 20
-		// Checkpoint progress frequently, and set the checkpoint size limit.
+		// Ensure that checkpoints happen every time by setting a large checkpoint size.
+		// Because setting 0 for the FrontierCheckpointFrequency disables checkpointing,
+		// setting 1 nanosecond is the smallest possible value.
 		changefeedbase.FrontierCheckpointFrequency.Override(
-			context.Background(), &s.Server.ClusterSettings().SV, 10*time.Millisecond)
+			context.Background(), &s.Server.ClusterSettings().SV, 1*time.Nanosecond)
 		changefeedbase.FrontierCheckpointMaxBytes.Override(
 			context.Background(), &s.Server.ClusterSettings().SV, maxCheckpointSize)
 
@@ -1188,36 +1238,52 @@ func TestAlterChangefeedAddTargetsDuringSchemaChangeError(t *testing.T) {
 		var backfillTimestamp hlc.Timestamp
 		var initialCheckpoint roachpb.SpanGroup
 		var foundCheckpoint int32
+		progressBackoff := jobRecordPollFrequency
+		var nextProgressCheck time.Time
 		knobs.FilterSpanWithMutation = func(r *jobspb.ResolvedSpan) (bool, error) {
 			// Stop resolving anything after checkpoint set to avoid eventually resolving the full span
 			if initialCheckpoint.Len() > 0 {
 				return true, nil
 			}
+			t.Logf("span %s %s %s", r.Span.String(), r.BoundaryType.String(), r.Timestamp.String())
 
 			// A backfill begins when the associated resolved event arrives, which has a
 			// timestamp such that all backfill spans have a timestamp of timestamp.Next().
 			if r.BoundaryType == expectedBoundaryType {
+				t.Logf("setting boundary timestamp %s", r.Timestamp.String())
 				backfillTimestamp = r.Timestamp
 				return false, nil
 			}
 
-			// Check if we've set a checkpoint yet
-			progress := loadProgress(t, jobFeed, jobRegistry)
-			if p := progress.GetChangefeed(); p != nil && p.Checkpoint != nil && len(p.Checkpoint.Spans) > 0 {
-				initialCheckpoint.Add(p.Checkpoint.Spans...)
-				atomic.StoreInt32(&foundCheckpoint, 1)
+			// Avoid reading for the job progress too frequently. Attempting
+			// to read the job record continuously in a loop may continuously
+			// abort the transaction which is trying to write the job record.
+			if nextProgressCheck.IsZero() || nextProgressCheck.Before(timeutil.Now()) {
+				// Check if we've set a checkpoint yet
+				progress := loadProgress(t, jobFeed, jobRegistry)
+				if p := progress.GetChangefeed(); p != nil && p.Checkpoint != nil && len(p.Checkpoint.Spans) > 0 {
+					initialCheckpoint.Add(p.Checkpoint.Spans...)
+					atomic.StoreInt32(&foundCheckpoint, 1)
+					t.Logf("found checkpoint %v", p.Checkpoint.Spans)
+				}
+				nextProgressCheck = timeutil.Now().Add(progressBackoff)
 			}
 
 			// Filter non-backfill-related spans
 			if !r.Timestamp.Equal(backfillTimestamp.Next()) {
+				skip := !(backfillTimestamp.IsEmpty() || r.Timestamp.LessEq(backfillTimestamp.Next()))
+				t.Logf("handling span %s: %t", r.Span.String(), skip)
 				// Only allow spans prior to a valid backfillTimestamp to avoid moving past the backfill
-				return !(backfillTimestamp.IsEmpty() || r.Timestamp.LessEq(backfillTimestamp.Next())), nil
+				return skip, nil
 			}
 
 			// Only allow resolving if we definitely won't have a completely resolved table
 			if !r.Span.Equal(tableSpan) && haveGaps {
-				return rnd.Intn(10) > 7, nil
+				skip := rnd.Intn(10) > 7
+				t.Logf("handling span %s: %t", r.Span.String(), skip)
+				return skip, nil
 			}
+			t.Logf("skipping span %s", r.Span.String())
 			haveGaps = true
 			return true, nil
 		}
@@ -1254,8 +1320,11 @@ func TestAlterChangefeedAddTargetsDuringBackfill(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	rnd, _ := randutil.NewTestRand()
-	var rndMu syncutil.Mutex
+	var rndMu struct {
+		syncutil.Mutex
+		rnd *rand.Rand
+	}
+	rndMu.rnd, _ = randutil.NewTestRand()
 	const maxCheckpointSize = 1 << 20
 	const numRowsPerTable = 1000
 
@@ -1276,11 +1345,19 @@ func TestAlterChangefeedAddTargetsDuringBackfill(t *testing.T) {
 			Changefeed.(*TestingKnobs)
 
 		// Ensure Scan Requests are always small enough that we receive multiple
-		// resolvedFoo events during a backfill
+		// resolvedFoo events during a backfill.
+		const maxBatchSize = numRowsPerTable / 5
 		knobs.FeedKnobs.BeforeScanRequest = func(b *kv.Batch) error {
 			rndMu.Lock()
 			defer rndMu.Unlock()
-			b.Header.MaxSpanRequestKeys = 1 + rnd.Int63n(100)
+			// We don't want batch sizes that are too small because they could cause
+			// the initial scan to take too long, leading to the waitForHighwater
+			// call below to time out. The formula below is completely arbitrary and
+			// was chosen to ensure that the batch sizes aren't too small (i.e. in
+			// the 1-2 digit range) but are still small enough that at least a few
+			// batches will be necessary.
+			b.Header.MaxSpanRequestKeys = maxBatchSize/2 + rndMu.rnd.Int63n(maxBatchSize/2)
+			t.Logf("set max span request keys: %d", b.Header.MaxSpanRequestKeys)
 			return nil
 		}
 
@@ -1301,7 +1378,7 @@ func TestAlterChangefeedAddTargetsDuringBackfill(t *testing.T) {
 				return false, nil
 			}
 			if haveGaps {
-				return rnd.Intn(10) > 7, nil
+				return rndMu.rnd.Intn(10) > 7, nil
 			}
 			haveGaps = true
 			return true, nil
@@ -1336,13 +1413,7 @@ func TestAlterChangefeedAddTargetsDuringBackfill(t *testing.T) {
 		jobFeed := testFeed.(cdctest.EnterpriseTestFeed)
 
 		// Wait for non-nil checkpoint.
-		testutils.SucceedsSoon(t, func() error {
-			progress := loadProgress(t, jobFeed, registry)
-			if p := progress.GetChangefeed(); p != nil && p.Checkpoint != nil && len(p.Checkpoint.Spans) > 0 {
-				return nil
-			}
-			return errors.New("waiting for checkpoint")
-		})
+		waitForCheckpoint(t, jobFeed, registry)
 
 		// Pause the job and read and verify the latest checkpoint information.
 		require.NoError(t, jobFeed.Pause())
@@ -1357,13 +1428,12 @@ func TestAlterChangefeedAddTargetsDuringBackfill(t *testing.T) {
 		var checkpoint roachpb.SpanGroup
 		checkpoint.Add(jobCheckpoint.Spans...)
 
-		waitForJobStatus(sqlDB, t, jobFeed.JobID(), `paused`)
-
 		sqlDB.Exec(t, fmt.Sprintf(`ALTER CHANGEFEED %d ADD bar WITH initial_scan`, jobFeed.JobID()))
 
 		// Collect spans we attempt to resolve after when we resume.
 		var resolvedFoo []roachpb.Span
 		knobs.FilterSpanWithMutation = func(r *jobspb.ResolvedSpan) (bool, error) {
+			t.Logf("resolved span: %#v", r)
 			if !r.Span.Equal(fooTableSpan) {
 				resolvedFoo = append(resolvedFoo, r.Span)
 			}
@@ -1372,14 +1442,8 @@ func TestAlterChangefeedAddTargetsDuringBackfill(t *testing.T) {
 
 		require.NoError(t, jobFeed.Resume())
 
-		// Wait for the high water mark to be non-zero.
-		testutils.SucceedsSoon(t, func() error {
-			prog := loadProgress(t, jobFeed, registry)
-			if p := prog.GetHighWater(); p != nil && !p.IsEmpty() {
-				return nil
-			}
-			return errors.New("waiting for highwater")
-		})
+		// Wait for highwater to be set, which signifies that the initial scan is complete.
+		waitForHighwater(t, jobFeed, registry)
 
 		// At this point, highwater mark should be set, and previous checkpoint should be gone.
 		progress = loadProgress(t, jobFeed, registry)
@@ -1394,7 +1458,7 @@ func TestAlterChangefeedAddTargetsDuringBackfill(t *testing.T) {
 		}
 	}
 
-	cdcTestWithSystem(t, testFn, feedTestEnterpriseSinks, feedTestNoExternalConnection, feedTestNoForcedSyntheticTimestamps)
+	cdcTestWithSystem(t, testFn, feedTestEnterpriseSinks, feedTestNoExternalConnection)
 }
 
 func TestAlterChangefeedInitialScan(t *testing.T) {

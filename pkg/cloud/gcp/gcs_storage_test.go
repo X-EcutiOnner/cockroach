@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package gcp
 
@@ -30,7 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/ioctx"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
-	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2/google"
 )
@@ -348,7 +343,7 @@ func TestFileDoesNotExist(t *testing.T) {
 
 	{
 		// Invalid gsFile.
-		gsFile := "gs://cockroach-fixtures/tpch-csv/sf-1/invalid_region.tbl?AUTH=implicit"
+		gsFile := "gs://cockroach-fixtures-us-east1/tpch-csv/sf-1/invalid_region.tbl?AUTH=implicit"
 		conf, err := cloud.ExternalStorageConfFromURI(gsFile, user)
 		require.NoError(t, err)
 
@@ -360,13 +355,13 @@ func TestFileDoesNotExist(t *testing.T) {
 		)
 		require.NoError(t, err)
 		_, _, err = s.ReadFile(context.Background(), "", cloud.ReadOptions{NoFileSize: true})
-		require.Error(t, err, "")
-		require.True(t, errors.Is(err, cloud.ErrFileDoesNotExist))
+		require.ErrorIs(t, err, cloud.ErrFileDoesNotExist)
 	}
 
 	{
-		// Invalid gsBucket.
-		gsFile := "gs://cockroach-fixtures-invalid/tpch-csv/sf-1/region.tbl?AUTH=implicit"
+		// Use a random UUID as the name of the bucket that does not exist in order
+		// to avoid name squating.
+		gsFile := fmt.Sprintf("gs://%s/tpch-csv/sf-1/region.tbl?AUTH=implicit", uuid.NewV4())
 		conf, err := cloud.ExternalStorageConfFromURI(gsFile, user)
 		require.NoError(t, err)
 
@@ -378,8 +373,7 @@ func TestFileDoesNotExist(t *testing.T) {
 		)
 		require.NoError(t, err)
 		_, _, err = s.ReadFile(context.Background(), "", cloud.ReadOptions{NoFileSize: true})
-		require.Error(t, err, "")
-		require.True(t, errors.Is(err, cloud.ErrFileDoesNotExist))
+		require.ErrorIs(t, err, cloud.ErrFileDoesNotExist)
 	}
 }
 
@@ -395,11 +389,11 @@ func TestCompressedGCS(t *testing.T) {
 
 	testSettings := cluster.MakeTestingClusterSettings()
 
-	// gsutil cp /usr/share/dict/words gs://cockroach-fixtures/words-compressed.txt
-	gsFile1 := "gs://cockroach-fixtures/words.txt?AUTH=implicit"
+	// gsutil cp /usr/share/dict/words gs://cockroach-fixtures-us-east1/words-compressed.txt
+	gsFile1 := "gs://cockroach-fixtures-us-east1/words.txt?AUTH=implicit"
 
-	// gsutil cp -Z /usr/share/dict/words gs://cockroach-fixtures/words-compressed.txt
-	gsFile2 := "gs://cockroach-fixtures/words-compressed.txt?AUTH=implicit"
+	// gsutil cp -Z /usr/share/dict/words gs://cockroach-fixtures-us-east1/words-compressed.txt
+	gsFile2 := "gs://cockroach-fixtures-us-east1/words-compressed.txt?AUTH=implicit"
 
 	conf1, err := cloud.ExternalStorageConfFromURI(gsFile1, user)
 	require.NoError(t, err)
@@ -477,13 +471,11 @@ func TestReadFileAtReturnsSize(t *testing.T) {
 	gsURI := fmt.Sprintf("gs://%s/%s-%d?AUTH=implicit", bucket, "read-file-at-returns-size", testID)
 	conf, err := cloud.ExternalStorageConfFromURI(gsURI, user)
 	require.NoError(t, err)
-	args := cloud.ExternalStorageContext{
-		IOConf:          base.ExternalIODirConfig{},
-		Settings:        testSettings,
-		DB:              nil,
-		Options:         nil,
-		Limiters:        nil,
-		MetricsRecorder: cloud.NilMetrics,
+	args := cloud.EarlyBootExternalStorageContext{
+		IOConf:   base.ExternalIODirConfig{},
+		Settings: testSettings,
+		Options:  nil,
+		Limiters: nil,
 	}
 	s, err := makeGCSStorage(ctx, args, conf)
 	require.NoError(t, err)

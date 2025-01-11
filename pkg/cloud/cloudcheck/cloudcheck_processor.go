@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package cloudcheck
 
@@ -113,7 +108,9 @@ func checkStorage(
 	}
 
 	buf := make([]byte, chunkSize)
-	_, _ = rand.Read(buf)
+	// This doesn't need to be cryptographic; pseudo-rand is enough to make the
+	// payload not completely compress away.
+	_, _ = rand.New(rand.NewSource(rand.Int63())).Read(buf)
 
 	var res result
 
@@ -236,8 +233,8 @@ func (p *proc) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata) {
 			return nil, p.DrainHelper()
 		}
 		return rowenc.EncDatumRow{
-			rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(p.EvalCtx.NodeID.SQLInstanceID()))),
-			rowenc.DatumToEncDatum(types.String, tree.NewDString(p.EvalCtx.Locality.String())),
+			rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(p.FlowCtx.EvalCtx.NodeID.SQLInstanceID()))),
+			rowenc.DatumToEncDatum(types.String, tree.NewDString(p.FlowCtx.EvalCtx.Locality.String())),
 			rowenc.DatumToEncDatum(types.Bool, tree.MakeDBool(tree.DBool(res.ok))),
 			rowenc.DatumToEncDatum(types.String, tree.NewDString(res.error)),
 			rowenc.DatumToEncDatum(types.Int, tree.NewDInt(tree.DInt(res.readBytes))),

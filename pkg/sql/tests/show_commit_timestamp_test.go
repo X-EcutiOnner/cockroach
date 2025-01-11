@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -15,7 +10,6 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"math/big"
-	"net/url"
 	"testing"
 
 	"github.com/cockroachdb/cockroach-go/v2/crdb"
@@ -78,7 +72,7 @@ CREATE TABLE foo (i INT PRIMARY KEY)`)
 
 	testutils.RunTrueAndFalse(t, "pgx batch; simple", func(t *testing.T, simple bool) {
 		resetTable(t)
-		pgURL, cleanup := sqlutils.PGUrl(t, s.ApplicationLayer().AdvSQLAddr(), "", url.User("root"))
+		pgURL, cleanup := s.ApplicationLayer().PGUrl(t)
 		defer cleanup()
 		conf, err := pgx.ParseConfig(pgURL.String())
 		require.NoError(t, err)
@@ -130,7 +124,7 @@ CREATE TABLE foo (i INT PRIMARY KEY)`)
 	})
 	testutils.RunTrueAndFalse(t, "pgx with crdb; simple", func(t *testing.T, simple bool) {
 		resetTable(t)
-		pgURL, cleanup := sqlutils.PGUrl(t, s.ApplicationLayer().AdvSQLAddr(), "", url.User("root"))
+		pgURL, cleanup := s.ApplicationLayer().PGUrl(t)
 		defer cleanup()
 		conf, err := pgx.ParseConfig(pgURL.String())
 		require.NoError(t, err)

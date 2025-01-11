@@ -1,10 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package changefeedccl
 
@@ -22,8 +19,11 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
+	"github.com/cockroachdb/cockroach/pkg/util/cidr"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
@@ -63,6 +63,7 @@ func makeWebhookSinkClient(
 	opts changefeedbase.WebhookSinkOptions,
 	batchCfg sinkBatchConfig,
 	parallelism int,
+	m metricsRecorder,
 ) (SinkClient, error) {
 	err := validateWebhookOpts(u, encodingOpts, opts)
 	if err != nil {
@@ -82,7 +83,7 @@ func makeWebhookSinkClient(
 	if opts.ClientTimeout != nil {
 		connTimeout = *opts.ClientTimeout
 	}
-	sinkClient.client, err = makeWebhookClient(u, connTimeout, parallelism)
+	sinkClient.client, err = makeWebhookClient(u, connTimeout, parallelism, m.netMetrics())
 	if err != nil {
 		return nil, err
 	}
@@ -104,13 +105,13 @@ func makeWebhookSinkClient(
 }
 
 func makeWebhookClient(
-	u sinkURL, timeout time.Duration, parallelism int,
+	u sinkURL, timeout time.Duration, parallelism int, nm *cidr.NetMetrics,
 ) (*httputil.Client, error) {
 	client := &httputil.Client{
 		Client: &http.Client{
 			Timeout: timeout,
 			Transport: &http.Transport{
-				DialContext:         (&net.Dialer{Timeout: timeout}).DialContext,
+				DialContext:         nm.Wrap((&net.Dialer{Timeout: timeout}).DialContext, "webhook"),
 				MaxConnsPerHost:     parallelism,
 				MaxIdleConnsPerHost: parallelism,
 				IdleConnTimeout:     time.Minute,
@@ -195,14 +196,27 @@ func (sc *webhookSinkClient) makePayloadForBytes(body []byte) (SinkPayload, erro
 	return req, nil
 }
 
-// MakeResolvedPayload implements the SinkClient interface
-func (sc *webhookSinkClient) MakeResolvedPayload(body []byte, topic string) (SinkPayload, error) {
-	return sc.makePayloadForBytes(body)
+// FlushResolvedPayload implements the SinkClient interface
+func (sc *webhookSinkClient) FlushResolvedPayload(
+	ctx context.Context, body []byte, _ func(func(topic string) error) error, retryOpts retry.Options,
+) error {
+	pl, err := sc.makePayloadForBytes(body)
+	if err != nil {
+		return err
+	}
+	return retry.WithMaxAttempts(ctx, retryOpts, retryOpts.MaxRetries+1, func() error {
+		return sc.Flush(ctx, pl)
+	})
 }
 
 // Flush implements the SinkClient interface
 func (sc *webhookSinkClient) Flush(ctx context.Context, batch SinkPayload) error {
 	req := batch.(*http.Request)
+	b, err := req.GetBody()
+	if err != nil {
+		return err
+	}
+	req.Body = b
 	res, err := sc.client.Do(req)
 	if err != nil {
 		return err
@@ -222,6 +236,10 @@ func (sc *webhookSinkClient) Flush(ctx context.Context, batch SinkPayload) error
 // Close implements the SinkClient interface
 func (sc *webhookSinkClient) Close() error {
 	sc.client.CloseIdleConnections()
+	return nil
+}
+
+func (sc *webhookSinkClient) CheckConnection(ctx context.Context) error {
 	return nil
 }
 
@@ -265,7 +283,7 @@ type webhookCSVBuffer struct {
 var _ BatchBuffer = (*webhookCSVBuffer)(nil)
 
 // Append implements the BatchBuffer interface
-func (cb *webhookCSVBuffer) Append(key []byte, value []byte) {
+func (cb *webhookCSVBuffer) Append(key []byte, value []byte, _ attributes) {
 	cb.bytes = append(cb.bytes, value...)
 	cb.messageCount += 1
 }
@@ -289,7 +307,7 @@ type webhookJSONBuffer struct {
 var _ BatchBuffer = (*webhookJSONBuffer)(nil)
 
 // Append implements the BatchBuffer interface
-func (jb *webhookJSONBuffer) Append(key []byte, value []byte) {
+func (jb *webhookJSONBuffer) Append(key []byte, value []byte, _ attributes) {
 	jb.messages = append(jb.messages, value)
 	jb.numBytes += len(value)
 }
@@ -340,13 +358,16 @@ func makeWebhookSink(
 	pacerFactory func() *admission.Pacer,
 	source timeutil.TimeSource,
 	mb metricsRecorderBuilder,
+	settings *cluster.Settings,
 ) (Sink, error) {
+	m := mb(requiresResourceAccounting)
+
 	batchCfg, retryOpts, err := getSinkConfigFromJson(opts.JSONConfig, sinkJSONConfig{})
 	if err != nil {
 		return nil, err
 	}
 
-	sinkClient, err := makeWebhookSinkClient(ctx, u, encodingOpts, opts, batchCfg, parallelism)
+	sinkClient, err := makeWebhookSinkClient(ctx, u, encodingOpts, opts, batchCfg, parallelism, m)
 	if err != nil {
 		return nil, err
 	}
@@ -361,6 +382,7 @@ func makeWebhookSink(
 		nil,
 		pacerFactory,
 		source,
-		mb(requiresResourceAccounting),
+		m,
+		settings,
 	), nil
 }

@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvserver
 
@@ -22,7 +17,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/benignerror"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -64,10 +58,11 @@ func TestBaseQueueConcurrent(t *testing.T) {
 		// We don't care about these, but we don't want to crash.
 		successes:       metric.NewCounter(metric.Metadata{Name: "processed"}),
 		failures:        metric.NewCounter(metric.Metadata{Name: "failures"}),
+		storeFailures:   metric.NewCounter(metric.Metadata{Name: "store_failures"}),
 		pending:         metric.NewGauge(metric.Metadata{Name: "pending"}),
 		processingNanos: metric.NewCounter(metric.Metadata{Name: "processingnanos"}),
 		purgatory:       metric.NewGauge(metric.Metadata{Name: "purgatory"}),
-		disabledConfig:  &settings.BoolSetting{},
+		disabledConfig:  testQueueEnabled,
 	}
 
 	// Set up a fake store with just exactly what the code calls into. Ideally
@@ -78,7 +73,7 @@ func TestBaseQueueConcurrent(t *testing.T) {
 			Clock:             hlc.NewClockForTesting(nil),
 			AmbientCtx:        log.MakeTestingAmbientContext(tr),
 			DefaultSpanConfig: roachpb.TestingDefaultSpanConfig(),
-			Settings:          cluster.MakeTestingClusterSettingsWithVersions(clusterversion.TestingBinaryVersion, clusterversion.TestingBinaryVersion, true),
+			Settings:          cluster.MakeTestingClusterSettingsWithVersions(clusterversion.Latest.Version(), clusterversion.Latest.Version(), true),
 		},
 	}
 
@@ -190,6 +185,6 @@ func (fr *fakeReplica) redirectOnOrAcquireLease(
 	// baseQueue only checks that the returned error is nil.
 	return kvserverpb.LeaseStatus{}, nil
 }
-func (fr *fakeReplica) LeaseStatusAt(context.Context, hlc.ClockTimestamp) kvserverpb.LeaseStatus {
+func (fr *fakeReplica) CurrentLeaseStatus(context.Context) kvserverpb.LeaseStatus {
 	return kvserverpb.LeaseStatus{}
 }

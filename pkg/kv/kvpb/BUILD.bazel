@@ -10,7 +10,6 @@ go_library(
     srcs = [
         "ambiguous_result_error.go",
         "api.go",
-        "api_requestheader.go",
         "batch.go",
         "data.go",
         "errors.go",
@@ -30,8 +29,10 @@ go_library(
         "//pkg/kv/kvserver/concurrency/lock",
         "//pkg/roachpb",
         "//pkg/storage/enginepb",
+        "//pkg/util/admission/admissionpb",
         "//pkg/util/buildutil",
         "//pkg/util/caller",
+        "//pkg/util/errorutil",
         "//pkg/util/hlc",
         "//pkg/util/humanizeutil",
         "//pkg/util/log",
@@ -61,7 +62,6 @@ go_test(
         "replica_unavailable_error_test.go",
         "string_test.go",
     ],
-    args = ["-test.timeout=295s"],
     data = glob(["testdata/**"]),
     embed = [":kvpb"],
     deps = [
@@ -73,6 +73,7 @@ go_test(
         "//pkg/storage/enginepb",
         "//pkg/testutils/echotest",
         "//pkg/util/buildutil",
+        "//pkg/util/encoding",
         "//pkg/util/hlc",
         "//pkg/util/protoutil",
         "//pkg/util/timeutil",
@@ -80,7 +81,7 @@ go_test(
         "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
         "@com_github_gogo_protobuf//proto",
-        "@com_github_golang_protobuf//proto:go_default_library",
+        "@com_github_golang_protobuf//proto",
         "@com_github_kr_pretty//:pretty",
         "@com_github_stretchr_testify//require",
         "@org_golang_google_grpc//codes",
@@ -101,6 +102,7 @@ proto_library(
         "//pkg/kv/kvserver/readsummary/rspb:rspb_proto",
         "//pkg/multitenant/tenantcapabilities/tenantcapabilitiespb:tenantcapabilitiespb_proto",
         "//pkg/roachpb:roachpb_proto",
+        "//pkg/rpc/rpcpb:rpcpb_proto",
         "//pkg/settings:settings_proto",
         "//pkg/sql/catalog/fetchpb:fetchpb_proto",
         "//pkg/storage/enginepb:enginepb_proto",
@@ -123,6 +125,7 @@ go_proto_library(
         "//pkg/kv/kvserver/readsummary/rspb",
         "//pkg/multitenant/tenantcapabilities/tenantcapabilitiespb",
         "//pkg/roachpb",
+        "//pkg/rpc/rpcpb",
         "//pkg/settings",
         "//pkg/sql/catalog/fetchpb",
         "//pkg/storage/enginepb",
@@ -158,5 +161,8 @@ batch_gen(
 
 disallowed_imports_test(
     "kvpb",
+    [
+        "//pkg/geo",
+    ],
     disallow_cdeps = True,
 )

@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package catalog
 
@@ -14,7 +9,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
+	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
@@ -177,7 +172,7 @@ type Index interface {
 	GetInvisibility() float64
 	GetPredicate() string
 	GetType() descpb.IndexDescriptor_Type
-	GetGeoConfig() geoindex.Config
+	GetGeoConfig() geopb.Config
 	GetVersion() descpb.IndexDescriptorVersion
 	GetEncodingType() catenumpb.IndexDescriptorEncodingType
 
@@ -239,7 +234,7 @@ type Index interface {
 	NumCompositeColumns() int
 	GetCompositeColumnID(compositeColumnOrdinal int) descpb.ColumnID
 	UseDeletePreservingEncoding() bool
-	// ForcePut forces all writes to use Put rather than CPut or InitPut.
+	// ForcePut forces all writes to use Put rather than CPut.
 	//
 	// Users of this options should take great care as it
 	// effectively mean unique constraints are not respected.
@@ -970,11 +965,6 @@ func ColumnIDToOrdinalMap(columns []Column) TableColMap {
 	return m
 }
 
-// ColumnTypes returns the types of the given columns
-func ColumnTypes(columns []Column) []*types.T {
-	return ColumnTypesWithInvertedCol(columns, nil /* invertedCol */)
-}
-
 // ColumnTypesWithInvertedCol returns the types of all given columns,
 // If invertedCol is non-nil, substitutes the type of the inverted
 // column instead of the column with the same ID.
@@ -987,6 +977,17 @@ func ColumnTypesWithInvertedCol(columns []Column, invertedCol Column) []*types.T
 		}
 	}
 	return t
+}
+
+// ColumnsByIDs returns a map of Columns keyed by their ID for the given table.
+func ColumnsByIDs(tbl TableDescriptor) map[descpb.ColumnID]Column {
+	cols := tbl.AllColumns()
+	byID := make(map[descpb.ColumnID]Column, len(cols))
+	for i := range cols {
+		col := cols[i]
+		byID[col.GetID()] = col
+	}
+	return byID
 }
 
 // ColumnNeedsBackfill returns true if adding or dropping (according to
@@ -1164,6 +1165,19 @@ func MustFindConstraintWithName(tbl TableDescriptor, name string) (Constraint, e
 
 // silence the linter
 var _ = MustFindConstraintWithName
+
+// FindTriggerByID traverses the slice returned by the GetTriggers method on the
+// table descriptor and returns the first trigger that matches the desired ID,
+// or nil if none was found.
+func FindTriggerByID(tbl TableDescriptor, id descpb.TriggerID) *descpb.TriggerDescriptor {
+	triggers := tbl.GetTriggers()
+	for i := range triggers {
+		if triggers[i].ID == id {
+			return &triggers[i]
+		}
+	}
+	return nil
+}
 
 // FindFamilyByID traverses the family descriptors on the table descriptor
 // and returns the first column family with the desired ID, or nil if none was

@@ -1,10 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Licensed as a CockroachDB Enterprise file under the Cockroach Community
-// License (the "License"); you may not use this file except in compliance with
-// the License. You may obtain a copy of the License at
-//
-//     https://github.com/cockroachdb/cockroach/blob/master/licenses/CCL.txt
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package changefeedccl
 
@@ -29,12 +26,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/bufalloc"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metamorphic"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -59,6 +56,7 @@ const (
 	sinkTypePubsub
 	sinkTypeCloudstorage
 	sinkTypeSQL
+	sinkTypePulsar
 )
 
 // externalResource is the interface common to both EventSink and
@@ -153,29 +151,48 @@ func getAndDialSink(
 	if err != nil {
 		return nil, err
 	}
-	return sink, sink.Dial()
+	if err := sink.Dial(); err != nil {
+		if closeErr := sink.Close(); closeErr != nil {
+			return nil, errors.CombineErrors(err, errors.Wrap(closeErr, `failed to close sink`))
+		}
+		return nil, err
+	}
+	return sink, nil
 }
 
 // WebhookV2Enabled determines whether or not the refactored Webhook sink
 // or the deprecated sink should be used.
 var WebhookV2Enabled = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"changefeed.new_webhook_sink_enabled",
 	"if enabled, this setting enables a new implementation of the webhook sink"+
 		" that allows for a much higher throughput",
-	util.ConstantWithMetamorphicTestBool("changefeed.new_webhook_sink.enabled", false),
+	// TODO: delete the original webhook sink code
+	metamorphic.ConstantWithTestBool("changefeed.new_webhook_sink.enabled", true),
 	settings.WithName("changefeed.new_webhook_sink.enabled"),
 )
 
 // PubsubV2Enabled determines whether or not the refactored Webhook sink
 // or the deprecated sink should be used.
 var PubsubV2Enabled = settings.RegisterBoolSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"changefeed.new_pubsub_sink_enabled",
 	"if enabled, this setting enables a new implementation of the pubsub sink"+
 		" that allows for a higher throughput",
-	util.ConstantWithMetamorphicTestBool("changefeed.new_pubsub_sink.enabled", false),
+	// TODO: delete the original pubsub sink code
+	metamorphic.ConstantWithTestBool("changefeed.new_pubsub_sink.enabled", true),
 	settings.WithName("changefeed.new_pubsub_sink.enabled"),
+)
+
+// KafkaV2Enabled determines whether or not the refactored Kafka sink
+// or the deprecated sink should be used.
+var KafkaV2Enabled = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	"changefeed.new_kafka_sink_enabled",
+	"if enabled, this setting enables a new implementation of the kafka sink with improved reliability",
+	// TODO(#126991): delete the original kafka sink code
+	metamorphic.ConstantWithTestBool("changefeed.new_kafka_sink.enabled", true),
+	settings.WithName("changefeed.new_kafka_sink.enabled"),
 )
 
 func getSink(
@@ -230,10 +247,23 @@ func getSink(
 				nullIsAccounted = knobs.NullSinkIsExternalIOAccounted
 			}
 			return makeNullSink(sinkURL{URL: u}, metricsBuilder(nullIsAccounted))
-		case u.Scheme == changefeedbase.SinkSchemeKafka:
+		case isKafkaSink(u):
 			return validateOptionsAndMakeSink(changefeedbase.KafkaValidOptions, func() (Sink, error) {
-				return makeKafkaSink(ctx, sinkURL{URL: u}, AllTargets(feedCfg), opts.GetKafkaConfigJSON(), serverCfg.Settings, metricsBuilder)
+				if KafkaV2Enabled.Get(&serverCfg.Settings.SV) {
+					return makeKafkaSinkV2(ctx, sinkURL{URL: u}, AllTargets(feedCfg), opts.GetKafkaConfigJSON(),
+						numSinkIOWorkers(serverCfg), newCPUPacerFactory(ctx, serverCfg), timeutil.DefaultTimeSource{},
+						serverCfg.Settings, metricsBuilder, kafkaSinkV2Knobs{})
+				} else {
+					return makeKafkaSink(ctx, sinkURL{URL: u}, AllTargets(feedCfg), opts.GetKafkaConfigJSON(), serverCfg.Settings, metricsBuilder)
+				}
 			})
+		case isPulsarSink(u):
+			var testingKnobs *TestingKnobs
+			if knobs, ok := serverCfg.TestingKnobs.Changefeed.(*TestingKnobs); ok {
+				testingKnobs = knobs
+			}
+			return makePulsarSink(ctx, sinkURL{URL: u}, encodingOpts, AllTargets(feedCfg), opts.GetKafkaConfigJSON(),
+				serverCfg.Settings, metricsBuilder, testingKnobs)
 		case isWebhookSink(u):
 			webhookOpts, err := opts.GetWebhookSinkOptions()
 			if err != nil {
@@ -242,7 +272,8 @@ func getSink(
 			if WebhookV2Enabled.Get(&serverCfg.Settings.SV) {
 				return validateOptionsAndMakeSink(changefeedbase.WebhookValidOptions, func() (Sink, error) {
 					return makeWebhookSink(ctx, sinkURL{URL: u}, encodingOpts, webhookOpts,
-						numSinkIOWorkers(serverCfg), newCPUPacerFactory(ctx, serverCfg), timeutil.DefaultTimeSource{}, metricsBuilder)
+						numSinkIOWorkers(serverCfg), newCPUPacerFactory(ctx, serverCfg), timeutil.DefaultTimeSource{},
+						metricsBuilder, serverCfg.Settings)
 				})
 			} else {
 				return validateOptionsAndMakeSink(changefeedbase.WebhookValidOptions, func() (Sink, error) {
@@ -256,8 +287,10 @@ func getSink(
 				testingKnobs = knobs
 			}
 			if PubsubV2Enabled.Get(&serverCfg.Settings.SV) {
-				return makePubsubSink(ctx, u, encodingOpts, opts.GetPubsubConfigJSON(), AllTargets(feedCfg), opts.IsSet(changefeedbase.OptUnordered),
-					numSinkIOWorkers(serverCfg), newCPUPacerFactory(ctx, serverCfg), timeutil.DefaultTimeSource{}, metricsBuilder, testingKnobs)
+				return makePubsubSink(ctx, u, encodingOpts, opts.GetPubsubConfigJSON(), AllTargets(feedCfg),
+					opts.IsSet(changefeedbase.OptUnordered), numSinkIOWorkers(serverCfg),
+					newCPUPacerFactory(ctx, serverCfg), timeutil.DefaultTimeSource{},
+					metricsBuilder, serverCfg.Settings, testingKnobs)
 			} else {
 				return makeDeprecatedPubsubSink(ctx, u, encodingOpts, AllTargets(feedCfg), opts.IsSet(changefeedbase.OptUnordered), metricsBuilder, testingKnobs)
 			}

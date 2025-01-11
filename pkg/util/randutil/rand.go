@@ -1,12 +1,7 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package randutil
 
@@ -40,22 +35,22 @@ func NewLockedSource(seed int64) rand.Source {
 
 func (rng *lockedSource) Int63() (n int64) {
 	rng.mu.Lock()
+	defer rng.mu.Unlock()
 	n = rng.src.Int63()
-	rng.mu.Unlock()
 	return
 }
 
 func (rng *lockedSource) Uint64() (n uint64) {
 	rng.mu.Lock()
+	defer rng.mu.Unlock()
 	n = rng.src.Uint64()
-	rng.mu.Unlock()
 	return
 }
 
 func (rng *lockedSource) Seed(seed int64) {
 	rng.mu.Lock()
+	defer rng.mu.Unlock()
 	rng.src.Seed(seed)
-	rng.mu.Unlock()
 }
 
 // globalSeed contains a pseudo random seed that should only be used in tests.
@@ -234,7 +229,8 @@ const PrintableKeyAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWX
 // alphanumeric chars.
 func RandString(rng *rand.Rand, length int, alphabet string) string {
 	runes := []rune(alphabet)
-	buf := &strings.Builder{}
+	var buf strings.Builder
+	buf.Grow(length)
 	for i := 0; i < length; i++ {
 		buf.WriteRune(runes[rng.Intn(len(runes))])
 	}
@@ -245,6 +241,7 @@ func RandString(rng *rand.Rand, length int, alphabet string) string {
 // value used. This function should be called from TestMain; individual tests
 // should not touch the seed of the global random number generator.
 func SeedForTests() {
+	//lint:ignore SA1019 deprecated
 	rand.Seed(globalSeed)
 	log.Printf("random seed: %v", globalSeed)
 }

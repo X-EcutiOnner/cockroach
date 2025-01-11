@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package jobs
 
@@ -27,8 +22,6 @@ const (
 	gcIntervalSettingKey           = "jobs.registry.interval.gc"
 	retentionTimeSettingKey        = "jobs.retention_time"
 	cancelUpdateLimitKey           = "jobs.cancel_update_limit"
-	retryInitialDelaySettingKey    = "jobs.registry.retry.initial_delay"
-	retryMaxDelaySettingKey        = "jobs.registry.retry.max_delay"
 	executionErrorsMaxEntriesKey   = "jobs.execution_errors.max_entries"
 	executionErrorsMaxEntrySizeKey = "jobs.execution_errors.max_entry_size"
 	debugPausePointsSettingKey     = "jobs.debug.pausepoints"
@@ -56,13 +49,6 @@ const (
 	// updated when canceling jobs concurrently from dead sessions.
 	defaultCancellationsUpdateLimit int64 = 1000
 
-	// defaultRetryInitialDelay is the initial delay in the calculation of exponentially
-	// increasing delays to retry failed jobs.
-	defaultRetryInitialDelay = 30 * time.Second
-
-	// defaultRetryMaxDelay is the maximum delay to retry a failed job.
-	defaultRetryMaxDelay = 24 * time.Hour
-
 	// defaultExecutionErrorsMaxEntries is the default number of error entries
 	// which will be retained.
 	defaultExecutionErrorsMaxEntries = 3
@@ -79,7 +65,7 @@ const (
 
 var (
 	intervalBaseSetting = settings.RegisterFloatSetting(
-		settings.TenantWritable,
+		settings.ApplicationLevel,
 		intervalBaseSettingKey,
 		"the base multiplier for other intervals such as adopt, cancel, and gc",
 		defaultIntervalBase,
@@ -87,7 +73,7 @@ var (
 	)
 
 	adoptIntervalSetting = settings.RegisterDurationSetting(
-		settings.TenantWritable,
+		settings.ApplicationLevel,
 		adoptIntervalSettingKey,
 		"the interval at which a node (a) claims some of the pending jobs and "+
 			"(b) restart its already claimed jobs that are in running or reverting "+
@@ -97,7 +83,7 @@ var (
 	)
 
 	cancelIntervalSetting = settings.RegisterDurationSetting(
-		settings.TenantWritable,
+		settings.ApplicationLevel,
 		cancelIntervalSettingKey,
 		"the interval at which a node cancels the jobs belonging to the known "+
 			"dead sessions",
@@ -108,7 +94,7 @@ var (
 	// PollJobsMetricsInterval is the interval at which a tenant in the cluster
 	// will poll the jobs table for metrics
 	PollJobsMetricsInterval = settings.RegisterDurationSetting(
-		settings.TenantWritable,
+		settings.ApplicationLevel,
 		metricsPollingIntervalKey,
 		"the interval at which a node in the cluster will poll the jobs table for metrics",
 		defaultPollForMetricsInterval,
@@ -116,7 +102,7 @@ var (
 	)
 
 	gcIntervalSetting = settings.RegisterDurationSetting(
-		settings.TenantWritable,
+		settings.ApplicationLevel,
 		gcIntervalSettingKey,
 		"the interval a node deletes expired job records that have exceeded their "+
 			"retention duration",
@@ -126,7 +112,7 @@ var (
 
 	// RetentionTimeSetting wraps "jobs.retention_timehelpers_test.go".
 	RetentionTimeSetting = settings.RegisterDurationSetting(
-		settings.TenantWritable,
+		settings.ApplicationLevel,
 		retentionTimeSettingKey,
 		"the amount of time for which records for completed jobs are retained",
 		defaultRetentionTime,
@@ -134,33 +120,15 @@ var (
 		settings.WithPublic)
 
 	cancellationsUpdateLimitSetting = settings.RegisterIntSetting(
-		settings.TenantWritable,
+		settings.ApplicationLevel,
 		cancelUpdateLimitKey,
 		"the number of jobs that can be updated when canceling jobs concurrently from dead sessions",
 		defaultCancellationsUpdateLimit,
 		settings.NonNegativeInt,
 	)
 
-	retryInitialDelaySetting = settings.RegisterDurationSetting(
-		settings.TenantWritable,
-		retryInitialDelaySettingKey,
-		"the starting duration of exponential-backoff delay"+
-			" to retry a job which encountered a retryable error or had its coordinator"+
-			" fail. The delay doubles after each retry.",
-		defaultRetryInitialDelay,
-		settings.NonNegativeDuration,
-	)
-
-	retryMaxDelaySetting = settings.RegisterDurationSetting(
-		settings.TenantWritable,
-		retryMaxDelaySettingKey,
-		"the maximum duration by which a job can be delayed to retry",
-		defaultRetryMaxDelay,
-		settings.PositiveDuration,
-	)
-
 	executionErrorsMaxEntriesSetting = settings.RegisterIntSetting(
-		settings.TenantWritable,
+		settings.ApplicationLevel,
 		executionErrorsMaxEntriesKey,
 		"the maximum number of retriable error entries which will be stored for introspection",
 		defaultExecutionErrorsMaxEntries,
@@ -168,7 +136,7 @@ var (
 	)
 
 	executionErrorsMaxEntrySize = settings.RegisterByteSizeSetting(
-		settings.TenantWritable,
+		settings.ApplicationLevel,
 		executionErrorsMaxEntrySizeKey,
 		"the maximum byte size of individual error entries which will be stored"+
 			" for introspection",
@@ -176,7 +144,7 @@ var (
 	)
 
 	debugPausepoints = settings.RegisterStringSetting(
-		settings.TenantWritable,
+		settings.ApplicationLevel,
 		debugPausePointsSettingKey,
 		"the list, comma separated, of named pausepoints currently enabled for debugging",
 		"",
@@ -200,8 +168,8 @@ func jitter(dur time.Duration) time.Duration {
 //
 // Common usage pattern:
 //
-//	lc, cleanup := makeLoopController(...)
-//	defer cleanup()
+//	lc := makeLoopController(...)
+//	defer lc.cleanup()
 //	for {
 //	  select {
 //	  case <- lc.update:
@@ -212,7 +180,7 @@ func jitter(dur time.Duration) time.Duration {
 //	  }
 //	}
 type loopController struct {
-	timer   *timeutil.Timer
+	timer   timeutil.Timer
 	lastRun time.Time
 	updated chan struct{}
 	// getInterval returns the value of the associated cluster setting.
@@ -220,13 +188,12 @@ type loopController struct {
 }
 
 // makeLoopController returns a structure that controls the execution of a job
-// at regular intervals. Moreover, it returns a cleanup function that should be
-// deferred to execute before destroying the instantiated structure.
+// at regular intervals. The structure's cleanup method should be deferred to
+// execute before destroying the instantiated structure.
 func makeLoopController(
 	st *cluster.Settings, s *settings.DurationSetting, overrideKnob *time.Duration,
-) (loopController, func()) {
+) loopController {
 	lc := loopController{
-		timer:   timeutil.NewTimer(),
 		lastRun: timeutil.Now(),
 		updated: make(chan struct{}, 1),
 		// getInterval returns the value of the associated cluster setting. If
@@ -253,7 +220,7 @@ func makeLoopController(
 	intervalBaseSetting.SetOnChange(&st.SV, onChange)
 
 	lc.timer.Reset(jitter(lc.getInterval()))
-	return lc, func() { lc.timer.Stop() }
+	return lc
 }
 
 // onUpdate is called when the associated interval setting gets updated.
@@ -265,4 +232,9 @@ func (lc *loopController) onUpdate() {
 func (lc *loopController) onExecute() {
 	lc.lastRun = timeutil.Now()
 	lc.timer.Reset(jitter(lc.getInterval()))
+}
+
+// cleanup stops the loop controller's timer.
+func (lc *loopController) cleanup() {
+	lc.timer.Stop()
 }

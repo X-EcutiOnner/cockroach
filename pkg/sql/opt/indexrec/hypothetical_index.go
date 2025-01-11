@@ -1,17 +1,13 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package indexrec
 
 import (
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
+	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
@@ -115,6 +111,11 @@ func (hi *hypotheticalIndex) IsInverted() bool {
 	return hi.inverted
 }
 
+// IsVector is part of the cat.Index interface.
+func (hi *hypotheticalIndex) IsVector() bool {
+	return false
+}
+
 // GetInvisibility is part of the cat.Index interface.
 func (hi *hypotheticalIndex) GetInvisibility() float64 {
 	// A hypotheticalIndex should not be invisible because there is no motivation
@@ -147,10 +148,10 @@ func (hi *hypotheticalIndex) LaxKeyColumnCount() int {
 	return hi.KeyColumnCount()
 }
 
-// NonInvertedPrefixColumnCount is part of the cat.Index interface.
-func (hi *hypotheticalIndex) NonInvertedPrefixColumnCount() int {
-	if !hi.IsInverted() {
-		panic(errors.AssertionFailedf("non-inverted indexes do not have inverted prefix columns"))
+// PrefixColumnCount is part of the cat.Index interface.
+func (hi *hypotheticalIndex) PrefixColumnCount() int {
+	if !hi.IsInverted() && !hi.IsVector() {
+		panic(errors.AssertionFailedf("only inverted and vector indexes have prefix columns"))
 	}
 	return len(hi.cols) - 1
 }
@@ -176,6 +177,11 @@ func (hi *hypotheticalIndex) InvertedColumn() cat.IndexColumn {
 		panic(errors.AssertionFailedf("non-inverted indexes do not have inverted columns"))
 	}
 	return hi.cols[len(hi.cols)-1]
+}
+
+// VectorColumn is part of the cat.Index interface.
+func (hi *hypotheticalIndex) VectorColumn() cat.IndexColumn {
+	panic(errors.AssertionFailedf("hypothetical indexes do not have vector columns"))
 }
 
 // Predicate is part of the cat.Index interface.
@@ -214,7 +220,7 @@ func (hi *hypotheticalIndex) ImplicitPartitioningColumnCount() int {
 }
 
 // GeoConfig is part of the cat.Index interface.
-func (hi *hypotheticalIndex) GeoConfig() geoindex.Config {
+func (hi *hypotheticalIndex) GeoConfig() geopb.Config {
 	if hi.IsInverted() {
 		srcCol := hi.tab.Column(hi.InvertedColumn().InvertedSourceColumnOrdinal())
 		switch srcCol.DatumType().Family() {
@@ -224,7 +230,7 @@ func (hi *hypotheticalIndex) GeoConfig() geoindex.Config {
 			return *geoindex.DefaultGeographyIndexConfig()
 		}
 	}
-	return geoindex.Config{}
+	return geopb.Config{}
 }
 
 // Version is part of the cat.Index interface.
@@ -270,8 +276,8 @@ func (hi *hypotheticalIndex) hasPrefixOfExplicitCols(
 		existingIndexCol := existingIndex.Column(j)
 		indexCol := indexCols[j]
 
-		if isInverted && existingIndex.IsInverted() && j == m-1 {
-			// If the column is inverted, compare the source columns.
+		if indexCol.Kind() == cat.Inverted && existingIndexCol.Kind() == cat.Inverted {
+			// If the columns are inverted, compare their source columns.
 			if existingIndexCol.InvertedSourceColumnOrdinal() != indexCol.InvertedSourceColumnOrdinal() {
 				return false
 			}

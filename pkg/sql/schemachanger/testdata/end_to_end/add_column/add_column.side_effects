@@ -26,8 +26,7 @@ write *eventpb.AlterTable to event log:
   mutationId: 1
   sql:
     descriptorId: 106
-    statement: ALTER TABLE ‹db›.‹public›.‹tbl› ADD COLUMN ‹j› INT8 NOT NULL DEFAULT
-      ‹42›
+    statement: ALTER TABLE ‹db›.‹public›.‹tbl› ADD COLUMN ‹j› INT8 NOT NULL DEFAULT ‹42›
     tag: ALTER TABLE
     user: root
   tableName: db.public.tbl
@@ -151,6 +150,8 @@ upsert descriptor #106
   +        "1": i
   +        "2": k
   +        "3": j
+  +        "4294967292": crdb_internal_origin_timestamp
+  +        "4294967293": crdb_internal_origin_id
   +        "4294967294": tableoid
   +        "4294967295": crdb_internal_mvcc_timestamp
   +      families:
@@ -161,8 +162,7 @@ upsert descriptor #106
   +      name: tbl
   +    relevantStatements:
   +    - statement:
-  +        redactedStatement: ALTER TABLE ‹db›.‹public›.‹tbl› ADD COLUMN ‹j› INT8 NOT
-  +          NULL DEFAULT ‹42›
+  +        redactedStatement: ALTER TABLE ‹db›.‹public›.‹tbl› ADD COLUMN ‹j› INT8 NOT NULL DEFAULT ‹42›
   +        statement: ALTER TABLE db.public.tbl ADD COLUMN j INT8 NOT NULL DEFAULT 42
   +        statementTag: ALTER TABLE
   +    revertible: true
@@ -593,6 +593,8 @@ upsert descriptor #106
   -        "1": i
   -        "2": k
   -        "3": j
+  -        "4294967292": crdb_internal_origin_timestamp
+  -        "4294967293": crdb_internal_origin_id
   -        "4294967294": tableoid
   -        "4294967295": crdb_internal_mvcc_timestamp
   -      families:
@@ -603,8 +605,7 @@ upsert descriptor #106
   -      name: tbl
   -    relevantStatements:
   -    - statement:
-  -        redactedStatement: ALTER TABLE ‹db›.‹public›.‹tbl› ADD COLUMN ‹j› INT8 NOT
-  -          NULL DEFAULT ‹42›
+  -        redactedStatement: ALTER TABLE ‹db›.‹public›.‹tbl› ADD COLUMN ‹j› INT8 NOT NULL DEFAULT ‹42›
   -        statement: ALTER TABLE db.public.tbl ADD COLUMN j INT8 NOT NULL DEFAULT 42
   -        statementTag: ALTER TABLE
   -    targetRanks: <redacted>

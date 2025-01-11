@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package rpc
 
@@ -18,6 +13,7 @@ import (
 
 	"github.com/VividCortex/ewma"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
+	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/circuit"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -32,6 +28,79 @@ import (
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/status"
 )
+
+type peerStatus int
+
+const (
+	peerStatusInactive = iota
+	peerStatusHealthy
+	peerStatusUnhealthy
+	peerStatusDeleted
+)
+
+func (p *peer) setHealthyLocked() {
+	if p.mu.peerStatus == peerStatusDeleted {
+		return
+	}
+	p.ConnectionUnhealthyFor.Update(0)
+	switch p.mu.peerStatus {
+	case peerStatusUnhealthy:
+		p.ConnectionHealthy.Inc(1)
+		p.ConnectionUnhealthy.Dec(1)
+	case peerStatusInactive:
+		p.ConnectionHealthy.Inc(1)
+		p.ConnectionInactive.Dec(1)
+	}
+	p.mu.peerStatus = peerStatusHealthy
+}
+
+func (p *peer) setUnhealthyLocked(connUnhealthyFor int64) {
+	if p.mu.peerStatus == peerStatusDeleted {
+		return
+	}
+	p.ConnectionHealthyFor.Update(0)
+	p.ConnectionUnhealthyFor.Update(connUnhealthyFor)
+	p.AvgRoundTripLatency.Update(0)
+
+	switch p.mu.peerStatus {
+	case peerStatusHealthy:
+		p.ConnectionUnhealthy.Inc(1)
+		p.ConnectionHealthy.Dec(1)
+	case peerStatusInactive:
+		p.ConnectionUnhealthy.Inc(1)
+		p.ConnectionInactive.Dec(1)
+	}
+	p.mu.peerStatus = peerStatusUnhealthy
+}
+
+func (p *peer) setInactiveLocked() {
+	if p.mu.peerStatus == peerStatusDeleted {
+		return
+	}
+	p.ConnectionHealthyFor.Update(0)
+	p.ConnectionUnhealthyFor.Update(0)
+	p.AvgRoundTripLatency.Update(0)
+
+	switch p.mu.peerStatus {
+	case peerStatusHealthy:
+		p.ConnectionInactive.Inc(1)
+		p.ConnectionHealthy.Dec(1)
+	case peerStatusUnhealthy:
+		p.ConnectionInactive.Inc(1)
+		p.ConnectionUnhealthy.Dec(1)
+	}
+	p.mu.peerStatus = peerStatusInactive
+}
+
+func (p *peer) releaseMetricsLocked() {
+	if p.mu.peerStatus == peerStatusDeleted {
+		return
+	}
+	// Always set to inactive before releasing.
+	p.setInactiveLocked()
+	p.ConnectionInactive.Dec(1)
+	p.mu.peerStatus = peerStatusDeleted
+}
 
 // A peer is a remote node that we are trying to maintain a healthy RPC
 // connection (for a given connection class not known to the peer itself) to. It
@@ -60,18 +129,6 @@ type peer struct {
 	// active - it is the heartbeat loop and manages `mu.c.` (including
 	// recreating it after the connection fails and has to be redialed).
 	//
-	// NB: at the time of writing, we don't use the breaking capabilities,
-	// i.e. we don't check the circuit breaker in `Connect`. We will do that
-	// once the circuit breaker is mature, and then retire the breakers
-	// returned by Context.getBreaker.
-	//
-	// Currently what will happen when a peer is down is that `c` will be
-	// recreated (blocking new callers to `Connect()`), a connection attempt
-	// will be made, and callers will see the failure to this attempt.
-	//
-	// With the breaker, callers would be turned away eagerly until there
-	// is a known-healthy connection.
-	//
 	// mu must *NOT* be held while operating on `b`. This is because the async
 	// probe will sometimes have to synchronously acquire mu before spawning off.
 	b                  *circuit.Breaker
@@ -81,6 +138,7 @@ type peer struct {
 		// Copies of PeerSnap may be leaked outside of lock, since the memory within
 		// is never mutated in place.
 		PeerSnap
+		peerStatus peerStatus
 	}
 	remoteClocks *RemoteClockMonitor
 	// NB: lock order: peers.mu then peers.mu.m[k].mu (but better to avoid
@@ -166,7 +224,7 @@ func (p *peer) snap() PeerSnap {
 // map, the next attempt to dial the node will start from a blank slate. In
 // other words, even with this theoretical race, the situation will sort itself
 // out quickly.
-func (rpcCtx *Context) newPeer(k peerKey) *peer {
+func (rpcCtx *Context) newPeer(k peerKey, locality roachpb.Locality) *peer {
 	// Initialization here is a bit circular. The peer holds the breaker. The
 	// breaker probe references the peer because it needs to replace the one-shot
 	// Connection when it makes a new connection in the probe. And (all but the
@@ -174,15 +232,18 @@ func (rpcCtx *Context) newPeer(k peerKey) *peer {
 	// Connect method needs to do the short-circuiting (if a Connection is created
 	// while the breaker is tripped, we want to block in Connect only once we've
 	// seen the first heartbeat succeed).
+	pm, lm := rpcCtx.metrics.acquire(k, locality)
 	p := &peer{
-		peerMetrics:        rpcCtx.metrics.acquire(k),
+		peerMetrics:        pm,
 		logDisconnectEvery: log.Every(time.Minute),
 		k:                  k,
 		remoteClocks:       rpcCtx.RemoteClocks,
 		opts:               &rpcCtx.ContextOptions,
 		peers:              &rpcCtx.peers,
 		dial: func(ctx context.Context, target string, class ConnectionClass) (*grpc.ClientConn, error) {
-			return rpcCtx.grpcDialRaw(ctx, target, class, rpcCtx.testingDialOpts...)
+			additionalDialOpts := []grpc.DialOption{grpc.WithStatsHandler(&statsTracker{lm})}
+			additionalDialOpts = append(additionalDialOpts, rpcCtx.testingDialOpts...)
+			return rpcCtx.grpcDialRaw(ctx, target, class, additionalDialOpts...)
 		},
 		heartbeatInterval: rpcCtx.RPCHeartbeatInterval,
 		heartbeatTimeout:  rpcCtx.RPCHeartbeatTimeout,
@@ -197,12 +258,9 @@ func (rpcCtx *Context) newPeer(k peerKey) *peer {
 				p.launch(ctx, report, done)
 			})
 		},
-		// Use a noop EventHandler; we do our own logging in the probe since we'll
-		// have better information.
-		EventHandler: &circuit.EventLogger{Log: func(buf redact.StringBuilder) {}},
 	})
 	p.b = b
-	c := newConnectionToNodeID(k, b.Signal)
+	c := newConnectionToNodeID(p.opts, k, b.Signal)
 	p.mu.PeerSnap = PeerSnap{c: c}
 
 	return p
@@ -300,9 +358,11 @@ func (p *peer) run(ctx context.Context, report func(error), done func()) {
 			return
 		}
 
-		p.mu.Lock()
-		p.mu.c = newConnectionToNodeID(p.k, p.mu.c.breakerSignalFn)
-		p.mu.Unlock()
+		func() {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			p.mu.c = newConnectionToNodeID(p.opts, p.k, p.mu.c.breakerSignalFn)
+		}()
 
 		if p.snap().deleteAfter != 0 {
 			// Peer is in inactive mode, and we just finished up a probe, so
@@ -372,7 +432,7 @@ func runSingleHeartbeat(
 	request := &PingRequest{
 		OriginAddr:      opts.AdvertiseAddr,
 		TargetNodeID:    k.NodeID,
-		ServerVersion:   opts.Settings.Version.BinaryVersion(),
+		ServerVersion:   opts.Settings.Version.LatestVersion(),
 		LocalityAddress: opts.LocalityAddresses,
 		ClusterID:       &clusterID,
 		OriginNodeID:    opts.NodeID.Get(),
@@ -493,11 +553,11 @@ func (p *peer) runHeartbeatUntilFailure(
 
 func logOnHealthy(ctx context.Context, disconnected, now time.Time) {
 	var buf redact.StringBuilder
-	_, _ = redact.Fprintf(&buf, "connection is now healthy")
+	buf.SafeString("connection is now healthy")
 	// When the breaker was first created, we tripped it but disconnected will
 	// have been zero, so don't log a bogus duration in that case.
 	if !disconnected.IsZero() {
-		_, _ = redact.Fprintf(&buf, " (after %s)", now.Sub(disconnected).Round(time.Second))
+		buf.Printf(" (after %s)", redact.Safe(now.Sub(disconnected).Round(time.Second)))
 	}
 	log.Health.InfofDepth(ctx, 1, "%s", buf)
 }
@@ -516,19 +576,16 @@ func (p *peer) onInitialHeartbeatSucceeded(
 	// If the probe was inactive, the fact that we managed to heartbeat implies
 	// that it ought not have been.
 	p.mu.deleteAfter = 0
-
-	// Gauge updates.
-	p.ConnectionHealthy.Update(1)
-	p.ConnectionUnhealthy.Update(0)
-	p.ConnectionInactive.Update(0)
-	// ConnectionHealthyFor is already zero.
-	p.ConnectionUnhealthyFor.Update(0)
-	// AvgRoundTripLatency is already zero. We don't use the initial
-	// ping since it has overhead of TLS handshake, blocking dialback, etc.
+	p.setHealthyLocked()
 
 	// Counter updates.
 	p.ConnectionHeartbeats.Inc(1)
 	// ConnectionFailures is not updated here.
+
+	// Bind the connection's stream pool to the active gRPC connection. Do this
+	// ahead of signaling the connFuture, so that the stream pool is ready for use
+	// by the time the connFuture is resolved.
+	p.mu.c.batchStreamPool.Bind(ctx, cc)
 
 	// Close the channel last which is helpful for unit tests that
 	// first waitOrDefault for a healthy conn to then check metrics.
@@ -604,9 +661,9 @@ func maybeLogOnFailedHeartbeat(
 			var buf redact.StringBuilder
 			buf.SafeString("failed connection attempt")
 			if !snap.disconnected.IsZero() {
-				_, _ = redact.Fprintf(&buf, " (last connected %s ago)", now.Sub(snap.disconnected).Round(time.Millisecond))
+				buf.Printf(" (last connected %s ago)", redact.Safe(now.Sub(snap.disconnected).Round(time.Millisecond)))
 			} else {
-				_, _ = redact.Fprintf(&buf, " (never connected)")
+				buf.SafeString(" (never connected)")
 			}
 			log.Health.Errorf(ctx, "%v: %v", buf, err)
 		}
@@ -651,6 +708,10 @@ func (p *peer) onHeartbeatFailed(
 		err = &netutil.InitialHeartbeatFailedError{WrappedErr: err}
 		ls.c.connFuture.Resolve(nil /* cc */, err)
 	}
+
+	// Close down the stream pool that was bound to this connection.
+	ls.c.batchStreamPool.Close()
+
 	// By convention, we stick to updating breaker before updating peer
 	// to make it easier to write non-flaky tests.
 	report(err)
@@ -666,27 +727,13 @@ func (p *peer) onHeartbeatFailed(
 
 	maybeLogOnFailedHeartbeat(ctx, now, err, prevErr, *ls, &p.logDisconnectEvery)
 
-	nConnUnhealthy := int64(1)
-	nConnInactive := int64(0)
-	connUnhealthyFor := now.Sub(ls.disconnected).Nanoseconds() + 1 // 1ns for unit tests w/ manual clock
-	if ls.deleteAfter != 0 {
-		// The peer got marked as pending deletion, so the probe becomes lazy
-		// (i.e. we terminate the for-loop here and only probe again when someone
-		// consults the breaker). Reset the gauges, causing this peer to not be
-		// reflected in aggregate stats any longer.
-		nConnUnhealthy = 0
-		nConnInactive = 1
-		connUnhealthyFor = 0
+	// Only update the unhealthy duration if it is considered unhealthy.
+	if ls.deleteAfter == 0 {
+		connUnhealthyFor := now.Sub(ls.disconnected).Nanoseconds() + 1 // 1ns for unit tests w/ manual clock
+		p.setUnhealthyLocked(connUnhealthyFor)
+	} else {
+		p.setInactiveLocked()
 	}
-	// Gauge updates.
-	p.ConnectionHealthy.Update(0)
-	p.ConnectionUnhealthy.Update(nConnUnhealthy)
-	p.ConnectionInactive.Update(nConnInactive)
-	p.ConnectionHealthyFor.Update(0)
-	p.ConnectionUnhealthyFor.Update(connUnhealthyFor)
-	// NB: keep this last for TestGrpcDialInternal_ReconnectPeer.
-	p.AvgRoundTripLatency.Update(0)
-	p.roundTripLatency.Set(0)
 	// Counter updates.
 	p.ConnectionFailures.Inc(1)
 }
@@ -805,14 +852,16 @@ func (peers *peerMap) shouldDeleteAfter(myKey peerKey, err error) time.Duration 
 }
 
 func touchOldPeers(peers *peerMap, now time.Time) {
-	var sigs []circuit.Signal
-	peers.mu.RLock()
-	for _, p := range peers.mu.m {
-		if p.snap().deletable(now) {
-			sigs = append(sigs, p.b.Signal())
+	sigs := func() (sigs []circuit.Signal) {
+		peers.mu.RLock()
+		defer peers.mu.RUnlock()
+		for _, p := range peers.mu.m {
+			if p.snap().deletable(now) {
+				sigs = append(sigs, p.b.Signal())
+			}
 		}
-	}
-	peers.mu.RUnlock()
+		return sigs
+	}()
 
 	// Now, outside of the lock, query all of the collected Signals which will tip
 	// off the respective probes, which will perform self-removal from the map. To
@@ -860,7 +909,7 @@ func (p *peer) maybeDelete(ctx context.Context, now time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.mu.deleted = true
-	p.peerMetrics.release()
+	p.releaseMetricsLocked()
 }
 
 func launchConnStateWatcher(

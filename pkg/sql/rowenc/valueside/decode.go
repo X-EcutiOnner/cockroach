@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package valueside
 
@@ -17,10 +12,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgrepl/lsn"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/cockroach/pkg/util/tsearch"
+	"github.com/cockroachdb/cockroach/pkg/util/vector"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
 )
@@ -122,6 +119,12 @@ func DecodeUntaggedDatum(
 			return nil, b, err
 		}
 		return a.NewDPGLSN(tree.DPGLSN{LSN: lsn.LSN(data)}), b, nil
+	case types.RefCursorFamily:
+		b, data, err := encoding.DecodeUntaggedBytesValue(buf)
+		if err != nil {
+			return nil, b, err
+		}
+		return a.NewDRefCursor(tree.DString(data)), b, nil
 	case types.Box2DFamily:
 		b, data, err := encoding.DecodeUntaggedBox2DValue(buf)
 		if err != nil {
@@ -216,6 +219,16 @@ func DecodeUntaggedDatum(
 			return nil, b, err
 		}
 		return tree.NewDTSVector(v), b, nil
+	case types.PGVectorFamily:
+		b, data, err := encoding.DecodeUntaggedBytesValue(buf)
+		if err != nil {
+			return nil, b, err
+		}
+		vec, err := vector.Decode(data)
+		if err != nil {
+			return nil, b, err
+		}
+		return tree.NewDPGVector(vec), b, nil
 	case types.OidFamily:
 		// TODO: This possibly should decode to uint32 (with corresponding changes
 		// to encoding) to ensure that the value fits in a DOid without any loss of
@@ -246,7 +259,10 @@ func DecodeUntaggedDatum(
 	case types.VoidFamily:
 		return a.NewDVoid(), buf, nil
 	default:
-		return nil, buf, errors.Errorf("couldn't decode type %s", t.SQLStringForError())
+		if buildutil.CrdbTestBuild {
+			return nil, buf, errors.AssertionFailedf("unable to decode table value %s", t.SQLStringForError())
+		}
+		return nil, buf, errors.Errorf("unable to decode table value %s", t.SQLStringForError())
 	}
 }
 

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvnemesis
 
@@ -41,6 +36,8 @@ func (op Operation) Result() *Result {
 		return &o.Result
 	case *AddSSTableOperation:
 		return &o.Result
+	case *BarrierOperation:
+		return &o.Result
 	case *SplitOperation:
 		return &o.Result
 	case *MergeOperation:
@@ -54,6 +51,12 @@ func (op Operation) Result() *Result {
 	case *BatchOperation:
 		return &o.Result
 	case *ClosureTxnOperation:
+		return &o.Result
+	case *SavepointCreateOperation:
+		return &o.Result
+	case *SavepointReleaseOperation:
+		return &o.Result
+	case *SavepointRollbackOperation:
 		return &o.Result
 	default:
 		panic(errors.AssertionFailedf(`unknown operation: %T %v`, o, o))
@@ -131,6 +134,8 @@ func (op Operation) format(w *strings.Builder, fctx formatCtx) {
 		o.format(w, fctx)
 	case *AddSSTableOperation:
 		o.format(w, fctx)
+	case *BarrierOperation:
+		o.format(w, fctx)
 	case *SplitOperation:
 		o.format(w, fctx)
 	case *MergeOperation:
@@ -194,6 +199,12 @@ func (op Operation) format(w *strings.Builder, fctx formatCtx) {
 		if o.Txn != nil {
 			fmt.Fprintf(w, "\n%s// ^-- txnpb:(%s)", fctx.indent, o.Txn)
 		}
+	case *SavepointCreateOperation:
+		o.format(w, fctx)
+	case *SavepointReleaseOperation:
+		o.format(w, fctx)
+	case *SavepointRollbackOperation:
+		o.format(w, fctx)
 	default:
 		fmt.Fprintf(w, "%v", op.GetValue())
 	}
@@ -207,6 +218,18 @@ func (op GetOperation) format(w *strings.Builder, fctx formatCtx) {
 	methodName := `Get`
 	if op.ForUpdate {
 		methodName = `GetForUpdate`
+	}
+	if op.ForShare {
+		methodName = `GetForShare`
+	}
+	if op.SkipLocked {
+		// NB: SkipLocked is a property of a batch, not an individual operation. We
+		// don't have a way to represent this here, so we pretend it's part of the
+		// method name for debugging purposes.
+		methodName += "SkipLocked"
+	}
+	if op.GuaranteedDurability {
+		methodName += "GuaranteedDurability"
 	}
 	fmt.Fprintf(w, `%s.%s(%s%s)`, fctx.receiver, methodName, fctx.maybeCtx(), fmtKey(op.Key))
 	op.Result.format(w)
@@ -232,6 +255,18 @@ func (op ScanOperation) format(w *strings.Builder, fctx formatCtx) {
 	methodName := `Scan`
 	if op.ForUpdate {
 		methodName = `ScanForUpdate`
+	}
+	if op.ForShare {
+		methodName = `ScanForShare`
+	}
+	if op.SkipLocked {
+		// NB: SkipLocked is a property of a batch, not an individual operation. We
+		// don't have a way to represent this here, so we pretend it's part of the
+		// method name for debugging purposes.
+		methodName += "SkipLocked"
+	}
+	if op.GuaranteedDurability {
+		methodName += "GuaranteedDurability"
 	}
 	if op.Reverse {
 		methodName = `Reverse` + methodName
@@ -261,8 +296,8 @@ func (op DeleteRangeUsingTombstoneOperation) format(w *strings.Builder, fctx for
 }
 
 func (op AddSSTableOperation) format(w *strings.Builder, fctx formatCtx) {
-	fmt.Fprintf(w, `%s.AddSSTable(%s%s, %s, ... /* @%s */) // %d bytes`,
-		fctx.receiver, fctx.maybeCtx(), fmtKey(op.Span.Key), fmtKey(op.Span.EndKey), op.Seq, len(op.Data))
+	fmt.Fprintf(w, `%s.AddSSTable(%s%s, %s, ... /* @%s */)`,
+		fctx.receiver, fctx.maybeCtx(), fmtKey(op.Span.Key), fmtKey(op.Span.EndKey), op.Seq)
 	if op.AsWrites {
 		fmt.Fprintf(w, ` (as writes)`)
 	}
@@ -315,6 +350,16 @@ func (op AddSSTableOperation) format(w *strings.Builder, fctx formatCtx) {
 	}
 }
 
+func (op BarrierOperation) format(w *strings.Builder, fctx formatCtx) {
+	if op.WithLeaseAppliedIndex {
+		fmt.Fprintf(w, `%s.BarrierWithLAI(ctx, %s, %s)`,
+			fctx.receiver, fmtKey(op.Key), fmtKey(op.EndKey))
+	} else {
+		fmt.Fprintf(w, `%s.Barrier(ctx, %s, %s)`, fctx.receiver, fmtKey(op.Key), fmtKey(op.EndKey))
+	}
+	op.Result.format(w)
+}
+
 func (op SplitOperation) format(w *strings.Builder, fctx formatCtx) {
 	fmt.Fprintf(w, `%s.AdminSplit(ctx, %s, hlc.MaxTimestamp)`, fctx.receiver, fmtKey(op.Key))
 	op.Result.format(w)
@@ -350,6 +395,21 @@ func (op TransferLeaseOperation) format(w *strings.Builder, fctx formatCtx) {
 
 func (op ChangeZoneOperation) format(w *strings.Builder, fctx formatCtx) {
 	fmt.Fprintf(w, `env.UpdateZoneConfig(ctx, %s)`, op.Type)
+	op.Result.format(w)
+}
+
+func (op SavepointCreateOperation) format(w *strings.Builder, fctx formatCtx) {
+	fmt.Fprintf(w, `%s.CreateSavepoint(ctx, %d)`, fctx.receiver, int(op.ID))
+	op.Result.format(w)
+}
+
+func (op SavepointReleaseOperation) format(w *strings.Builder, fctx formatCtx) {
+	fmt.Fprintf(w, `%s.ReleaseSavepoint(ctx, %d)`, fctx.receiver, int(op.ID))
+	op.Result.format(w)
+}
+
+func (op SavepointRollbackOperation) format(w *strings.Builder, fctx formatCtx) {
+	fmt.Fprintf(w, `%s.RollbackSavepoint(ctx, %d)`, fctx.receiver, int(op.ID))
 	op.Result.format(w)
 }
 

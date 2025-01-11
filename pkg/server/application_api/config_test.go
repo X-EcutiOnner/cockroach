@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package application_api_test
 
@@ -15,44 +10,47 @@ import (
 	"fmt"
 	"net/url"
 	"reflect"
+	"slices"
+	"sort"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
+	// To ensure the streaming replication cluster setting is defined.
+	_ "github.com/cockroachdb/cockroach/pkg/crosscluster"
 	"github.com/cockroachdb/cockroach/pkg/server/apiconstants"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/srvtestutils"
 	"github.com/cockroachdb/cockroach/pkg/settings"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/safesql"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/slices"
 )
 
 func TestAdminAPISettings(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{
-		// Disable the default test tenant for now as this tests fails
-		// with it enabled. Tracked with #81590.
-		DefaultTestTenant: base.TODOTestTenantDisabled,
-	})
-	defer s.Stopper().Stop(context.Background())
+	srv, conn, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
 
 	// Any bool that defaults to true will work here.
 	const settingKey = "sql.metrics.statement_details.enabled"
 	st := s.ClusterSettings()
-	allKeys := settings.Keys(settings.ForSystemTenant)
+	target := settings.ForSystemTenant
+	if srv.TenantController().StartedDefaultTestTenant() {
+		target = settings.ForVirtualCluster
+	}
+	allKeys := settings.Keys(target)
 
 	checkSetting := func(t *testing.T, k settings.InternalKey, v serverpb.SettingsResponse_Value) {
-		ref, ok := settings.LookupForReportingByKey(k, settings.ForSystemTenant)
+		ref, ok := settings.LookupForReportingByKey(k, target)
 		if !ok {
 			t.Fatalf("%s: not found after initial lookup", k)
 		}
@@ -101,7 +99,7 @@ func TestAdminAPISettings(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// Check that all expected keys were returned
+		// Check that all expected keys were returned.
 		if len(allKeys) != len(resp.KeyValues) {
 			t.Fatalf("expected %d keys, got %d", len(allKeys), len(resp.KeyValues))
 		}
@@ -157,15 +155,22 @@ func TestAdminAPISettings(t *testing.T) {
 	t.Run("different-permissions", func(t *testing.T) {
 		var resp serverpb.SettingsResponse
 		nonAdminUser := apiconstants.TestingUserNameNoAdmin().Normalized()
-		consoleKeys := settings.ConsoleKeys()
+		var consoleKeys []settings.InternalKey
+		for _, k := range settings.ConsoleKeys() {
+			if _, ok := settings.LookupForLocalAccessByKey(k, target); !ok {
+				continue
+			}
+			consoleKeys = append(consoleKeys, k)
+		}
+		sort.Slice(consoleKeys, func(i, j int) bool { return consoleKeys[i] < consoleKeys[j] })
 
-		// Admin should return all cluster settings
+		// Admin should return all cluster settings.
 		if err := srvtestutils.GetAdminJSONProtoWithAdminOption(s, "settings", &resp, true); err != nil {
 			t.Fatal(err)
 		}
 		require.True(t, len(resp.KeyValues) == len(allKeys))
 
-		// Admin requesting specific cluster setting should return that cluster setting
+		// Admin requesting specific cluster setting should return that cluster setting.
 		if err := srvtestutils.GetAdminJSONProtoWithAdminOption(s, "settings?keys=sql.stats.persisted_rows.max",
 			&resp, true); err != nil {
 			t.Fatal(err)
@@ -173,11 +178,11 @@ func TestAdminAPISettings(t *testing.T) {
 		require.NotNil(t, resp.KeyValues["sql.stats.persisted_rows.max"])
 		require.True(t, len(resp.KeyValues) == 1)
 
-		// Non-admin with no permission should return error message
+		// Non-admin with no permission should return error message.
 		err := srvtestutils.GetAdminJSONProtoWithAdminOption(s, "settings", &resp, false)
 		require.Error(t, err, "this operation requires the VIEWCLUSTERSETTING or MODIFYCLUSTERSETTING system privileges")
 
-		// Non-admin with VIEWCLUSTERSETTING permission should return all cluster settings
+		// Non-admin with VIEWCLUSTERSETTING permission should return all cluster settings.
 		_, err = conn.Exec(fmt.Sprintf("ALTER USER %s VIEWCLUSTERSETTING", nonAdminUser))
 		require.NoError(t, err)
 		if err := srvtestutils.GetAdminJSONProtoWithAdminOption(s, "settings", &resp, false); err != nil {
@@ -185,7 +190,7 @@ func TestAdminAPISettings(t *testing.T) {
 		}
 		require.True(t, len(resp.KeyValues) == len(allKeys))
 
-		// Non-admin with VIEWCLUSTERSETTING permission requesting specific cluster setting should return that cluster setting
+		// Non-admin with VIEWCLUSTERSETTING permission requesting specific cluster setting should return that cluster setting.
 		if err := srvtestutils.GetAdminJSONProtoWithAdminOption(s, "settings?keys=sql.stats.persisted_rows.max",
 			&resp, false); err != nil {
 			t.Fatal(err)
@@ -193,7 +198,7 @@ func TestAdminAPISettings(t *testing.T) {
 		require.NotNil(t, resp.KeyValues["sql.stats.persisted_rows.max"])
 		require.True(t, len(resp.KeyValues) == 1)
 
-		// Non-admin with VIEWCLUSTERSETTING and VIEWACTIVITY permission should return all cluster settings
+		// Non-admin with VIEWCLUSTERSETTING and VIEWACTIVITY permission should return all cluster settings.
 		_, err = conn.Exec(fmt.Sprintf("ALTER USER %s VIEWACTIVITY", nonAdminUser))
 		require.NoError(t, err)
 		if err := srvtestutils.GetAdminJSONProtoWithAdminOption(s, "settings", &resp, false); err != nil {
@@ -210,13 +215,19 @@ func TestAdminAPISettings(t *testing.T) {
 		require.NotNil(t, resp.KeyValues["sql.stats.persisted_rows.max"])
 		require.True(t, len(resp.KeyValues) == 1)
 
-		// Non-admin with VIEWACTIVITY and not VIEWCLUSTERSETTING should only see console cluster settings
+		// Non-admin with VIEWACTIVITY and not VIEWCLUSTERSETTING should only see console cluster settings.
 		_, err = conn.Exec(fmt.Sprintf("ALTER USER %s NOVIEWCLUSTERSETTING", nonAdminUser))
 		require.NoError(t, err)
 		if err := srvtestutils.GetAdminJSONProtoWithAdminOption(s, "settings", &resp, false); err != nil {
 			t.Fatal(err)
 		}
-		require.True(t, len(resp.KeyValues) == len(consoleKeys))
+
+		gotKeys := make([]string, 0, len(resp.KeyValues))
+		for k := range resp.KeyValues {
+			gotKeys = append(gotKeys, k)
+		}
+		sort.Strings(gotKeys)
+		require.Equal(t, len(consoleKeys), len(resp.KeyValues), "found:\n%+v\nexpected:\n%+v", gotKeys, consoleKeys)
 		for k := range resp.KeyValues {
 			require.True(t, slices.Contains(consoleKeys, settings.InternalKey(k)))
 		}
@@ -254,11 +265,7 @@ func TestClusterAPI(t *testing.T) {
 		testutils.RunTrueAndFalse(t, "enterpriseOn", func(t *testing.T, enterpriseOn bool) {
 			// Override server license check.
 			if enterpriseOn {
-				old := base.CheckEnterpriseEnabled
-				base.CheckEnterpriseEnabled = func(_ *cluster.Settings, _ uuid.UUID, _ string) error {
-					return nil
-				}
-				defer func() { base.CheckEnterpriseEnabled = old }()
+				defer ccl.TestingEnableEnterprise()()
 			}
 
 			if _, err := db.Exec(`SET CLUSTER SETTING diagnostics.reporting.enabled = $1`, reportingOn); err != nil {
@@ -282,8 +289,8 @@ func TestClusterAPI(t *testing.T) {
 				if a, e := resp.ReportingEnabled, reportingOn; a != e {
 					return errors.Errorf("reportingEnabled = %t, wanted %t", a, e)
 				}
-				if a, e := resp.EnterpriseEnabled, enterpriseOn; a != e {
-					return errors.Errorf("enterpriseEnabled = %t, wanted %t", a, e)
+				if a := resp.EnterpriseEnabled; !a {
+					return errors.Errorf("enterpriseEnabled = %t, wanted true", a)
 				}
 				return nil
 			})

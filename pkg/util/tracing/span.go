@@ -1,22 +1,17 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tracing
 
 import (
 	"fmt"
-	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/util/debugutil"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
@@ -138,7 +133,7 @@ type Span struct {
 
 	// finishStack is set if debugUseAfterFinish is set. It represents the stack
 	// that called Finish(), in order to report it on further use.
-	finishStack string
+	finishStack debugutil.SafeStack
 }
 
 // IsNoop returns true if this span is a black hole - it doesn't correspond to a
@@ -173,9 +168,9 @@ func (sp *Span) detectUseAfterFinish() bool {
 	// In test builds, we panic on span use after Finish. This is in preparation
 	// of span pooling, at which point use-after-Finish would become corruption.
 	if alreadyFinished && sp.i.tracer.PanicOnUseAfterFinish() {
-		var finishStack string
-		if sp.finishStack == "" {
-			finishStack = "<stack not captured. Set debugUseAfterFinish>"
+		var finishStack debugutil.SafeStack
+		if sp.finishStack == nil {
+			finishStack = debugutil.SafeStack("<stack not captured. Set debugUseAfterFinish>")
 		} else {
 			finishStack = sp.finishStack
 		}
@@ -253,7 +248,7 @@ func (sp *Span) finishInternal() {
 		return
 	}
 	if sp.Tracer().debugUseAfterFinish {
-		sp.finishStack = string(debug.Stack())
+		sp.finishStack = debugutil.Stack()
 	}
 	atomic.StoreInt32(&sp.finished, 1)
 	sp.i.Finish()
@@ -703,41 +698,42 @@ func (sp *Span) reset(
 		// Nobody is supposed to have a reference to the span at this point, but let's
 		// take the lock anyway to protect against buggy clients accessing the span
 		// after Finish().
-		c.mu.Lock()
-		if len(c.mu.openChildren) != 0 {
-			panic(errors.AssertionFailedf("unexpected children in span being reset: %v", c.mu.openChildren))
-		}
-		if len(c.mu.tags) != 0 {
-			panic(errors.AssertionFailedf("unexpected tags in span being reset: %v", c.mu.tags))
-		}
-		if !c.mu.recording.finishedChildren.Empty() {
-			panic(errors.AssertionFailedf("unexpected finished children in span being reset: %v", c.mu.recording.finishedChildren))
-		}
-		if c.mu.recording.structured.Len() != 0 {
-			panic(errors.AssertionFailedf("unexpected structured recording in span being reset"))
-		}
-		if c.mu.recording.logs.Len() != 0 {
-			panic(errors.AssertionFailedf("unexpected logs in span being reset"))
-		}
+		func() {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			if len(c.mu.openChildren) != 0 {
+				panic(errors.AssertionFailedf("unexpected children in span being reset: %v", c.mu.openChildren))
+			}
+			if len(c.mu.tags) != 0 {
+				panic(errors.AssertionFailedf("unexpected tags in span being reset: %v", c.mu.tags))
+			}
+			if !c.mu.recording.finishedChildren.Empty() {
+				panic(errors.AssertionFailedf("unexpected finished children in span being reset: %v", c.mu.recording.finishedChildren))
+			}
+			if c.mu.recording.structured.Len() != 0 {
+				panic(errors.AssertionFailedf("unexpected structured recording in span being reset"))
+			}
+			if c.mu.recording.logs.Len() != 0 {
+				panic(errors.AssertionFailedf("unexpected logs in span being reset"))
+			}
+			h := sp.helper
+			c.mu.crdbSpanMu = crdbSpanMu{
+				duration:     -1, // unfinished
+				openChildren: h.childrenAlloc[:0],
+				goroutineID:  goroutineID,
+				recording: recordingState{
+					logs:             makeSizeLimitedBuffer[*tracingpb.LogRecord](maxLogBytesPerSpan, nil /* scratch */),
+					structured:       makeSizeLimitedBuffer[*tracingpb.StructuredRecord](maxStructuredBytesPerSpan, h.structuredEventsAlloc[:]),
+					childrenMetadata: h.childrenMetadataAlloc,
+					finishedChildren: MakeTrace(tracingpb.RecordedSpan{}),
+				},
+				tags: h.tagsAlloc[:0],
+			}
 
-		h := sp.helper
-		c.mu.crdbSpanMu = crdbSpanMu{
-			duration:     -1, // unfinished
-			openChildren: h.childrenAlloc[:0],
-			goroutineID:  goroutineID,
-			recording: recordingState{
-				logs:             makeSizeLimitedBuffer[*tracingpb.LogRecord](maxLogBytesPerSpan, nil /* scratch */),
-				structured:       makeSizeLimitedBuffer[*tracingpb.StructuredRecord](maxStructuredBytesPerSpan, h.structuredEventsAlloc[:]),
-				childrenMetadata: h.childrenMetadataAlloc,
-				finishedChildren: MakeTrace(tracingpb.RecordedSpan{}),
-			},
-			tags: h.tagsAlloc[:0],
-		}
-
-		if kind != oteltrace.SpanKindUnspecified {
-			c.setTagLocked(SpanKindTagKey, attribute.StringValue(kind.String()))
-		}
-		c.mu.Unlock()
+			if kind != oteltrace.SpanKindUnspecified {
+				c.setTagLocked(SpanKindTagKey, attribute.StringValue(kind.String()))
+			}
+		}()
 	}
 
 	// We only mark the span as not finished at the end so that accesses to the
@@ -745,7 +741,7 @@ func (sp *Span) reset(
 	// detect use-after-Finish. Similarly, we do the write atomically to prevent
 	// reorderings.
 	atomic.StoreInt32(&sp.finished, 0)
-	sp.finishStack = ""
+	sp.finishStack = nil
 }
 
 // SetOtelStatus sets the status of the OpenTelemetry span (if any).
@@ -945,11 +941,8 @@ func (sm SpanMeta) ToProto() *tracingpb.TraceInfo {
 func SpanMetaFromProto(info tracingpb.TraceInfo) SpanMeta {
 	var otelCtx oteltrace.SpanContext
 	if info.Otel != nil {
-		// NOTE: The ugly starry expressions below can be simplified once/if direct
-		// conversions from slices to arrays gets adopted:
-		// https://github.com/golang/go/issues/46505
-		traceID := *(*[16]byte)(info.Otel.TraceID)
-		spanID := *(*[8]byte)(info.Otel.SpanID)
+		traceID := [16]byte(info.Otel.TraceID)
+		spanID := [8]byte(info.Otel.SpanID)
 		otelCtx = otelCtx.WithRemote(true).WithTraceID(traceID).WithSpanID(spanID)
 	}
 

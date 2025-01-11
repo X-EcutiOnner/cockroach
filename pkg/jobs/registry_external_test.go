@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package jobs_test
 
@@ -26,17 +21,21 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
+	"github.com/cockroachdb/cockroach/pkg/jobs/jobstest"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness/slstorage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -109,12 +108,17 @@ RETURNING id;
 	terminalStatuses := []jobs.Status{jobs.StatusSucceeded, jobs.StatusCanceled, jobs.StatusFailed}
 	terminalIDs := make([]jobspb.JobID, len(terminalStatuses))
 	terminalClaims := make([][]byte, len(terminalStatuses))
+	mkSessionID := func() []byte {
+		sessionID, err := slstorage.MakeSessionID([]byte("us"), uuid.MakeV4())
+		require.NoError(t, err)
+		return []byte(sessionID)
+	}
 	for i, s := range terminalStatuses {
-		terminalClaims[i] = uuid.MakeV4().GetBytes() // bogus claim
+		terminalClaims[i] = mkSessionID() // bogus claim
 		tdb.QueryRow(t, insertQuery, s, terminalClaims[i], 42).Scan(&terminalIDs[i])
 	}
 	var nonTerminalID jobspb.JobID
-	tdb.QueryRow(t, insertQuery, jobs.StatusRunning, uuid.MakeV4().GetBytes(), 42).Scan(&nonTerminalID)
+	tdb.QueryRow(t, insertQuery, jobs.StatusRunning, mkSessionID(), 42).Scan(&nonTerminalID)
 
 	checkClaimEqual := func(id jobspb.JobID, exp []byte) error {
 		const getClaimQuery = `SELECT claim_session_id FROM system.jobs WHERE id = $1`
@@ -363,9 +367,9 @@ func TestGCDurationControl(t *testing.T) {
 		},
 	}
 
-	jobs.RegisterConstructor(jobspb.TypeImport, func(_ *jobs.Job, cs *cluster.Settings) jobs.Resumer {
-		return jobs.FakeResumer{}
-	}, jobs.UsesTenantCostControl)
+	defer jobs.TestingRegisterConstructor(jobspb.TypeImport, func(_ *jobs.Job, cs *cluster.Settings) jobs.Resumer {
+		return jobstest.FakeResumer{}
+	}, jobs.UsesTenantCostControl)()
 	s, sqlDB, _ := serverutils.StartServer(t, args)
 	defer s.Stopper().Stop(ctx)
 	registry := s.JobRegistry().(*jobs.Registry)
@@ -428,7 +432,7 @@ func TestErrorsPopulatedOnRetry(t *testing.T) {
 		return event{id: j.ID(), resume: make(chan error)}
 	}
 	evChan := make(chan event)
-	jobs.RegisterConstructor(jobspb.TypeImport, func(j *jobs.Job, cs *cluster.Settings) jobs.Resumer {
+	defer jobs.TestingRegisterConstructor(jobspb.TypeImport, func(j *jobs.Job, cs *cluster.Settings) jobs.Resumer {
 		execFn := func(ctx context.Context) error {
 			ev := mkEvent(j)
 			select {
@@ -443,11 +447,11 @@ func TestErrorsPopulatedOnRetry(t *testing.T) {
 				return ctx.Err()
 			}
 		}
-		return jobs.FakeResumer{
+		return jobstest.FakeResumer{
 			OnResume:     execFn,
 			FailOrCancel: execFn,
 		}
-	}, jobs.UsesTenantCostControl)
+	}, jobs.UsesTenantCostControl)()
 	s, sqlDB, _ := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
@@ -513,15 +517,7 @@ func TestErrorsPopulatedOnRetry(t *testing.T) {
 		}
 		return ret
 	}
-	tsEqual := func(t *testing.T, a, b time.Time) {
-		require.Truef(t, a.Equal(b), "%v != %v", a, b)
-	}
-	tsBefore := func(t *testing.T, a, b time.Time) {
-		require.Truef(t, a.Before(b), "%v >= %v", a, b)
-	}
 	executionErrorEqual := func(t *testing.T, a, b parsedError) {
-		tsEqual(t, a.start, b.start)
-		tsEqual(t, a.end, b.end)
 		require.Equal(t, a.instance, b.instance)
 		require.Equal(t, a.error, b.error)
 		require.Equal(t, a.status, b.status)
@@ -529,17 +525,14 @@ func TestErrorsPopulatedOnRetry(t *testing.T) {
 	waitForEvent := func(t *testing.T, id jobspb.JobID) (ev event, start time.Time) {
 		ev = <-evChan
 		require.Equal(t, id, ev.id)
-		tdb.QueryRow(t, "SELECT last_run FROM crdb_internal.jobs WHERE job_id = $1", id).Scan(&start)
+		tdb.QueryRow(t, "SELECT now() FROM crdb_internal.jobs WHERE job_id = $1", id).Scan(&start)
 		return ev, start
 	}
 	checkExecutionError := func(
-		t *testing.T, execErr parsedError, status jobs.Status, start, afterEnd time.Time, cause string,
+		t *testing.T, execErr parsedError, status jobs.Status, _, _ time.Time, cause string,
 	) {
 		require.Equal(t, base.SQLInstanceID(1), execErr.instance)
 		require.Equal(t, status, execErr.status)
-		tsEqual(t, start, execErr.start)
-		tsBefore(t, execErr.start, execErr.end)
-		tsBefore(t, execErr.end, afterEnd)
 		require.Equal(t, cause, execErr.error)
 	}
 	getExecErrors := func(t *testing.T, id jobspb.JobID) []parsedError {
@@ -554,7 +547,7 @@ SELECT unnest(execution_errors)
 		t *testing.T, id jobspb.JobID, status jobs.Status,
 		from, to time.Time, cause string,
 	) {
-		log.Flush()
+		log.FlushFiles()
 		entries, err := log.FetchEntriesFromFiles(
 			from.UnixNano(), to.UnixNano(), 2,
 			regexp.MustCompile(fmt.Sprintf(
@@ -716,4 +709,84 @@ SELECT unnest(execution_errors)
 		close(seventhRun.resume)
 		require.Regexp(t, err3, registry.WaitForJobs(ctx, []jobspb.JobID{id}))
 	})
+}
+
+// TestWaitWithRetryableError tests retryable errors when querying
+// for jobs.
+func TestWaitWithRetryableError(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	defer jobs.ResetConstructors()()
+	ctx := context.Background()
+
+	cs := cluster.MakeTestingClusterSettings()
+	// Set the lease duration to zero for instanty expiry.
+	lease.LeaseDuration.Override(ctx, &cs.SV, 0)
+	// Renewal timeout to 0 saying that the lease will get renewed only
+	// after the lease expires when a request requests the descriptor.
+	lease.LeaseRenewalDuration.Override(ctx, &cs.SV, 0)
+
+	var targetJobID atomic.Int64
+	var numberOfTimesDetected atomic.Int64
+	const targetNumberOfRetries = 5
+	args := base.TestServerArgs{
+		Settings: cs,
+		// Leasing settings used above conflict with some updates
+		// when starting the server, so skip those.
+		PartOfCluster: true,
+		Knobs: base.TestingKnobs{
+			SQLExecutor: &sql.ExecutorTestingKnobs{
+				DisableAutoCommitDuringExec: true,
+				AfterExecute: func(ctx context.Context, stmt string, isInternal bool, err error) {
+					if targetJobID.Load() > 0 &&
+						strings.Contains(stmt, "SELECT count(*) FROM system.jobs") &&
+						strings.Contains(stmt, fmt.Sprintf("%d", targetJobID.Load())) {
+						// Leases expire almost instantly, without a renewal we will need
+						// a retry.
+						time.Sleep(time.Second)
+						// Detect this multiple times to ensure retries, once observed
+						// enough times disable the after execution.
+						if numberOfTimesDetected.Add(1) > targetNumberOfRetries-1 {
+							targetJobID.Store(0)
+						}
+					}
+				},
+			},
+		},
+	}
+
+	defer jobs.TestingRegisterConstructor(jobspb.TypeImport, func(_ *jobs.Job, cs *cluster.Settings) jobs.Resumer {
+		return jobstest.FakeResumer{}
+	}, jobs.UsesTenantCostControl)()
+	s := serverutils.StartServerOnly(t, args)
+	defer s.Stopper().Stop(ctx)
+	ts := s.ApplicationLayer()
+	registry := ts.JobRegistry().(*jobs.Registry)
+
+	// Create and run a dummy job.
+	idb := ts.InternalDB().(isql.DB)
+	id := registry.MakeJobID()
+	require.NoError(t, idb.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		_, err := registry.CreateJobWithTxn(ctx, jobs.Record{
+			// Job does not accept an empty Details field, so arbitrarily provide
+			// ImportDetails.
+			Details:  jobspb.ImportDetails{},
+			Progress: jobspb.ImportProgress{},
+			Username: username.TestUserName(),
+		}, id, txn)
+		return err
+	}))
+	targetJobID.Store(int64(id))
+	require.NoError(t,
+		registry.WaitForJobs(
+			ctx, []jobspb.JobID{id},
+		))
+	if !skip.Duress() {
+		require.Equalf(t, int64(targetNumberOfRetries), numberOfTimesDetected.Load(), "jobs query did not retry")
+	} else {
+		// For stress be lenient since we are relying on timing for leasing
+		// expiration, which can be imprecise. So, lets aim for at least one
+		// retry.
+		require.GreaterOrEqualf(t, numberOfTimesDetected.Load(), int64(2), "jobs query did not retry")
+	}
 }
