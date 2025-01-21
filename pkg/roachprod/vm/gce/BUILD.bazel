@@ -3,6 +3,8 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "gce",
     srcs = [
+        "dns.go",
+        "fast_dns.go",
         "gcloud.go",
         "utils.go",
     ],
@@ -10,13 +12,21 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/roachprod/config",
+        "//pkg/roachprod/errors",
         "//pkg/roachprod/logger",
+        "//pkg/roachprod/ui",
         "//pkg/roachprod/vm",
         "//pkg/roachprod/vm/flagstub",
+        "//pkg/util/randutil",
+        "//pkg/util/retry",
+        "//pkg/util/syncutil",
         "//pkg/util/timeutil",
         "@com_github_cockroachdb_errors//:errors",
+        "@com_github_masterminds_semver_v3//:semver",
         "@com_github_spf13_pflag//:pflag",
         "@org_golang_google_api//cloudbilling/v1beta",
+        "@org_golang_x_crypto//ssh",
+        "@org_golang_x_exp//maps",
         "@org_golang_x_sync//errgroup",
     ],
 )
@@ -25,7 +35,12 @@ go_test(
     name = "gce_test",
     size = "small",
     srcs = ["gcloud_test.go"],
-    args = ["-test.timeout=55s"],
     embed = [":gce"],
-    deps = ["@com_github_stretchr_testify//assert"],
+    deps = [
+        "//pkg/roachprod/vm",
+        "//pkg/util/randutil",
+        "//pkg/util/timeutil",
+        "@com_github_cockroachdb_errors//:errors",
+        "@com_github_stretchr_testify//assert",
+    ],
 )

@@ -1,12 +1,7 @@
 // Copyright 2020 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tabledesc
 
@@ -15,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
+	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
@@ -265,7 +260,7 @@ func (w index) CollectCompositeColumnIDs() catalog.TableColSet {
 }
 
 // GetGeoConfig returns the geo config in the index descriptor.
-func (w index) GetGeoConfig() geoindex.Config {
+func (w index) GetGeoConfig() geopb.Config {
 	return w.desc.GeoConfig
 }
 
@@ -396,7 +391,7 @@ func (w index) UseDeletePreservingEncoding() bool {
 	return w.desc.UseDeletePreservingEncoding && !w.maybeMutation.DeleteOnly()
 }
 
-// ForcePut forces all writes to use Put rather than CPut or InitPut.
+// ForcePut forces all writes to use Put rather than CPut.
 //
 // Users of this options should take great care as it
 // effectively mean unique constraints are not respected.
@@ -513,6 +508,11 @@ func (w index) GetConstraintValidity() descpb.ConstraintValidity {
 // IsEnforced implements the catalog.Constraint interface.
 func (w index) IsEnforced() bool {
 	return !w.IsMutation() || w.WriteAndDeleteOnly()
+}
+
+// NewTestIndex wraps an index descriptor in an index struct for use in unit tests.
+func NewTestIndex(desc *descpb.IndexDescriptor, ordinal int) index {
+	return index{desc: desc, ordinal: ordinal}
 }
 
 // partitioning is the backing struct for a catalog.Partitioning interface.

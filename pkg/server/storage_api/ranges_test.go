@@ -1,17 +1,13 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package storage_api_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -22,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/srvtestutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -32,12 +29,20 @@ func TestRangesResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	defer kvserver.EnableLeaseHistoryForTesting(100)()
-	ts := serverutils.StartServerOnly(t, base.TestServerArgs{})
-	defer ts.Stopper().Stop(context.Background())
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	ts := srv.ApplicationLayer()
+
+	// Create few ranges
+	r := sqlutils.MakeSQLRunner(ts.SQLConn(t))
+	r.Exec(t, "CREATE TABLE t (x INT PRIMARY KEY, xsquared INT)")
+	for i := 0; i < 5; i++ {
+		r.Exec(t, fmt.Sprintf("ALTER TABLE t SPLIT AT VALUES (%d)", 100*i/5))
+	}
 
 	t.Run("test ranges response", func(t *testing.T) {
 		// Perform a scan to ensure that all the raft groups are initialized.
-		if _, err := ts.DB().Scan(context.Background(), keys.LocalMax, roachpb.KeyMax, 0); err != nil {
+		if _, err := srv.SystemLayer().DB().Scan(context.Background(), keys.LocalMax, roachpb.KeyMax, 0); err != nil {
 			t.Fatal(err)
 		}
 
@@ -100,12 +105,17 @@ func TestRangesResponse(t *testing.T) {
 	})
 }
 
-func TestTenantRangesResponse(t *testing.T) {
+// TestTenantRangesSecurity checks that the storage layer properly zeroes out
+// if it's missing a tenant ID in the TenantRanges back-end RPC.
+func TestTenantRangesSecurity(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	ts := serverutils.StartServerOnly(t, base.TestServerArgs{})
-	defer ts.Stopper().Stop(ctx)
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+	})
+	defer srv.Stopper().Stop(ctx)
+	ts := srv.SystemLayer()
 
 	t.Run("returns error when TenantID not set in ctx", func(t *testing.T) {
 		rpcStopper := stop.NewStopper()
@@ -122,13 +132,19 @@ func TestRangeResponse(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	defer kvserver.EnableLeaseHistoryForTesting(100)()
-	ts := serverutils.StartServerOnly(t, base.TestServerArgs{})
-	defer ts.Stopper().Stop(context.Background())
+	srv := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(110018),
+	})
+	defer srv.Stopper().Stop(context.Background())
+	ts := srv.ApplicationLayer()
 
 	// Perform a scan to ensure that all the raft groups are initialized.
-	if _, err := ts.DB().Scan(context.Background(), keys.LocalMax, roachpb.KeyMax, 0); err != nil {
+	if _, err := srv.SystemLayer().DB().Scan(context.Background(), keys.LocalMax, roachpb.KeyMax, 0); err != nil {
 		t.Fatal(err)
 	}
+
+	// TODO(#110018): grant a special capability to the secondary tenant
+	// before the endpoint can be accessed.
 
 	var response serverpb.RangeResponse
 	if err := srvtestutils.GetStatusJSONProto(ts, "range/1", &response); err != nil {
@@ -149,7 +165,7 @@ func TestRangeResponse(t *testing.T) {
 
 	// The response should include just the one range.
 	if e, a := 1, len(node1Response.Infos); e != a {
-		t.Errorf("got the wrong number of ranges in the response, expected %d, actual %d", e, a)
+		t.Fatalf("got the wrong number of ranges in the response, expected %d, actual %d", e, a)
 	}
 
 	info := node1Response.Infos[0]

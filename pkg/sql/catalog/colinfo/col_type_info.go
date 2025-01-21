@@ -1,12 +1,7 @@
 // Copyright 2019 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package colinfo
 
@@ -14,7 +9,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/cockroachdb/cockroach/pkg/clusterversion"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -70,7 +65,7 @@ func (ti ColTypeInfo) Type(idx int) *types.T {
 
 // ValidateColumnDefType returns an error if the type of a column definition is
 // not valid. It is checked when a column is created or altered.
-func ValidateColumnDefType(ctx context.Context, version clusterversion.Handle, t *types.T) error {
+func ValidateColumnDefType(ctx context.Context, st *cluster.Settings, t *types.T) error {
 	switch t.Family() {
 	case types.StringFamily, types.CollatedStringFamily:
 		if t.Family() == types.CollatedStringFamily {
@@ -102,12 +97,13 @@ func ValidateColumnDefType(ctx context.Context, version clusterversion.Handle, t
 		if err := types.CheckArrayElementType(t.ArrayContents()); err != nil {
 			return err
 		}
-		return ValidateColumnDefType(ctx, version, t.ArrayContents())
+		return ValidateColumnDefType(ctx, st, t.ArrayContents())
 
 	case types.BitFamily, types.IntFamily, types.FloatFamily, types.BoolFamily, types.BytesFamily, types.DateFamily,
 		types.INetFamily, types.IntervalFamily, types.JsonFamily, types.OidFamily, types.TimeFamily,
 		types.TimestampFamily, types.TimestampTZFamily, types.UuidFamily, types.TimeTZFamily,
-		types.GeographyFamily, types.GeometryFamily, types.EnumFamily, types.Box2DFamily:
+		types.GeographyFamily, types.GeometryFamily, types.EnumFamily, types.Box2DFamily,
+		types.TSQueryFamily, types.TSVectorFamily, types.PGLSNFamily, types.PGVectorFamily, types.RefCursorFamily:
 	// These types are OK.
 
 	case types.TupleFamily:
@@ -116,20 +112,6 @@ func ValidateColumnDefType(ctx context.Context, version clusterversion.Handle, t
 		}
 		if t.TypeMeta.ImplicitRecordType {
 			return unimplemented.NewWithIssue(70099, "cannot use table record type as table column")
-		}
-
-	case types.TSQueryFamily, types.TSVectorFamily:
-		if !version.IsActive(ctx, clusterversion.V23_1) {
-			return pgerror.Newf(pgcode.FeatureNotSupported,
-				"TSVector/TSQuery not supported until version 23.1")
-		}
-
-	case types.PGLSNFamily:
-		if !version.IsActive(ctx, clusterversion.V23_2) {
-			return pgerror.Newf(
-				pgcode.FeatureNotSupported,
-				"pg_lsn not supported until version 23.2",
-			)
 		}
 
 	default:
@@ -142,9 +124,18 @@ func ValidateColumnDefType(ctx context.Context, version clusterversion.Handle, t
 
 // ColumnTypeIsIndexable returns whether the type t is valid as an indexed column.
 func ColumnTypeIsIndexable(t *types.T) bool {
-	if t.IsAmbiguous() || t.Family() == types.TupleFamily {
+	// NB: .IsAmbiguous checks the content type of array types.
+	if t.IsAmbiguous() || t.Family() == types.TupleFamily || t.Family() == types.RefCursorFamily {
 		return false
 	}
+
+	// If the type is an array, check its content type as well.
+	if unwrapped := t.ArrayContents(); unwrapped != nil {
+		if unwrapped.Family() == types.TupleFamily || unwrapped.Family() == types.RefCursorFamily {
+			return false
+		}
+	}
+
 	// Some inverted index types also have a key encoding, but we don't
 	// want to support those yet. See #50659.
 	return !MustBeValueEncoded(t) && !ColumnTypeIsOnlyInvertedIndexable(t)
@@ -154,7 +145,9 @@ func ColumnTypeIsIndexable(t *types.T) bool {
 // using an inverted index.
 func ColumnTypeIsInvertedIndexable(t *types.T) bool {
 	switch t.Family() {
-	case types.JsonFamily, types.ArrayFamily, types.StringFamily:
+	case types.ArrayFamily:
+		return t.ArrayContents().Family() != types.RefCursorFamily
+	case types.JsonFamily, types.StringFamily:
 		return true
 	}
 	return ColumnTypeIsOnlyInvertedIndexable(t)
@@ -193,6 +186,8 @@ func MustBeValueEncoded(semanticType *types.T) bool {
 	case types.TupleFamily, types.GeographyFamily, types.GeometryFamily:
 		return true
 	case types.TSVectorFamily, types.TSQueryFamily:
+		return true
+	case types.PGVectorFamily:
 		return true
 	}
 	return false

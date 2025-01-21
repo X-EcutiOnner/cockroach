@@ -1,12 +1,7 @@
 // Copyright 2018 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package testcat
 
@@ -20,7 +15,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
-	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
+	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
@@ -349,10 +344,7 @@ func (tc *Catalog) CreateTable(stmt *tree.CreateTable) *Table {
 	for _, def := range stmt.Defs {
 		switch def := def.(type) {
 		case *tree.CheckConstraintTableDef:
-			tab.Checks = append(tab.Checks, cat.CheckConstraint{
-				Constraint: serializeTableDefExpr(def.Expr),
-				Validated:  validatedCheckConstraint(def),
-			})
+			tab.addCheckConstraint(def)
 		}
 	}
 
@@ -686,6 +678,35 @@ func (tc *Catalog) resolveFK(tab *Table, d *tree.ForeignKeyConstraintTableDef) {
 	targetTable.inboundFKs = append(targetTable.inboundFKs, fk)
 }
 
+func (tt *Table) addCheckConstraint(check *tree.CheckConstraintTableDef) {
+	var columnOrdinals []int
+	visitFn := func(expr tree.Expr) (recurse bool, newExpr tree.Expr, err error) {
+		if vBase, ok := expr.(tree.VarName); ok {
+			v, err := vBase.NormalizeVarName()
+			if err != nil {
+				return false, nil, err
+			}
+			if c, ok := v.(*tree.ColumnItem); ok {
+				colID := tt.FindOrdinal(string(c.ColumnName))
+				columnOrdinals = append(columnOrdinals, colID)
+			}
+			return false, v, nil
+		}
+		return true, expr, nil
+	}
+
+	// Collect the columns referenced by the check expr.
+	if _, err := tree.SimpleVisit(check.Expr, visitFn); err != nil {
+		panic(fmt.Sprintf("failed to find columns in check expr %s", check.Expr.String()))
+	}
+
+	tt.Checks = append(tt.Checks, &CheckConstraint{
+		constraint:     serializeTableDefExpr(check.Expr),
+		validated:      validatedCheckConstraint(check),
+		columnOrdinals: columnOrdinals,
+	})
+}
+
 func (tt *Table) addUniqueConstraint(
 	name tree.Name, columns tree.IndexElemList, predicate tree.Expr, withoutIndex bool,
 ) {
@@ -756,6 +777,9 @@ func (tt *Table) addColumn(def *tree.ColumnTableDef) {
 		name = n
 		kind = cat.DeleteOnly
 		visibility = cat.Inaccessible
+	}
+	if def.Hidden && visibility == cat.Visible {
+		visibility = cat.Hidden
 	}
 
 	var defaultExpr, computedExpr, onUpdateExpr, generatedAsIdentitySequenceOption *string
@@ -860,10 +884,11 @@ func (tt *Table) addIndexWithVersion(
 		IdxName:      tt.makeIndexName(def.Name, def.Columns, typ),
 		Unique:       typ != nonUniqueIndex,
 		Inverted:     def.Inverted,
+		Vector:       def.Vector,
 		IdxZone:      cat.EmptyZone(),
 		table:        tt,
 		version:      version,
-		Invisibility: def.Invisibility,
+		Invisibility: def.Invisibility.Value,
 	}
 
 	// Look for name suffixes indicating this is a mutation index.
@@ -886,8 +911,12 @@ func (tt *Table) addIndexWithVersion(
 	notNullIndex := true
 	for i, colDef := range def.Columns {
 		isLastIndexCol := i == len(def.Columns)-1
-		if def.Inverted && isLastIndexCol {
-			idx.invertedOrd = i
+		if isLastIndexCol {
+			if def.Inverted {
+				idx.invertedOrd = i
+			} else if def.Vector {
+				idx.vectorOrd = i
+			}
 		}
 		col := idx.addColumn(tt, colDef, keyCol, isLastIndexCol)
 
@@ -899,13 +928,13 @@ func (tt *Table) addIndexWithVersion(
 			switch tt.Columns[col.InvertedSourceColumnOrdinal()].DatumType().Family() {
 			case types.GeometryFamily:
 				// Don't use the default config because it creates a huge number of spans.
-				idx.geoConfig = geoindex.Config{
-					S2Geometry: &geoindex.S2GeometryConfig{
+				idx.geoConfig = geopb.Config{
+					S2Geometry: &geopb.S2GeometryConfig{
 						MinX: -5,
 						MaxX: 5,
 						MinY: -5,
 						MaxY: 5,
-						S2Config: &geoindex.S2Config{
+						S2Config: &geopb.S2Config{
 							MinLevel: 0,
 							MaxLevel: 2,
 							LevelMod: 1,
@@ -916,8 +945,8 @@ func (tt *Table) addIndexWithVersion(
 
 			case types.GeographyFamily:
 				// Don't use the default config because it creates a huge number of spans.
-				idx.geoConfig = geoindex.Config{
-					S2Geography: &geoindex.S2GeographyConfig{S2Config: &geoindex.S2Config{
+				idx.geoConfig = geopb.Config{
+					S2Geography: &geopb.S2GeographyConfig{S2Config: &geopb.S2Config{
 						MinLevel: 0,
 						MaxLevel: 2,
 						LevelMod: 1,
@@ -937,7 +966,7 @@ func (tt *Table) addIndexWithVersion(
 	}
 	if partitionBy != nil {
 		ctx := context.Background()
-		semaCtx := tree.MakeSemaContext()
+		semaCtx := tree.MakeSemaContext(nil /* resolver */)
 		evalCtx := eval.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 
 		if len(partitionBy.List) > 0 {
@@ -1042,6 +1071,8 @@ func (tt *Table) addIndexWithVersion(
 	for _, name := range def.Storing {
 		if def.Inverted {
 			panic("inverted indexes don't support stored columns")
+		} else if def.Vector {
+			panic("vector indexes don't support stored columns")
 		}
 		// Only add storing columns that weren't added as part of adding implicit
 		// key columns.
@@ -1284,6 +1315,15 @@ func (ti *Index) addColumnByOrdinal(
 					"column %s of type %s is not allowed as the last column of an inverted index",
 					col.ColName(), srcColType,
 				))
+			}
+		} else if typ.Family() == types.PGVectorFamily {
+			if !ti.Vector {
+				panic(fmt.Errorf(
+					"column %s of type %s is not allowed in a non-vector index", col.ColName(), typ,
+				))
+			}
+			if typ.Width() == 0 {
+				panic(fmt.Errorf("variable-width vector columns are not allowed in a vector index"))
 			}
 		} else if !colinfo.ColumnTypeIsIndexable(typ) {
 			panic(fmt.Errorf("column %s of type %s is not indexable", col.ColName(), typ))

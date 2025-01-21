@@ -1,17 +1,13 @@
 // Copyright 2014 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package encoding
 
 import (
 	"bytes"
+	crypto_rand "crypto/rand"
 	"fmt"
 	"math"
 	"math/rand"
@@ -25,6 +21,7 @@ import (
 	// Blank import so projections are initialized correctly.
 	_ "github.com/cockroachdb/cockroach/pkg/geo/geographiclib"
 	"github.com/cockroachdb/cockroach/pkg/geo/geopb"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
@@ -487,7 +484,7 @@ func TestDecodeInvalid(t *testing.T) {
 func testPeekLength(t *testing.T, encoded []byte) {
 	gLen := rand.Intn(10)
 	garbage := make([]byte, gLen)
-	_, _ = rand.Read(garbage)
+	_, _ = crypto_rand.Read(garbage)
 
 	var buf []byte
 	buf = append(buf, encoded...)
@@ -830,7 +827,7 @@ func TestEncodeBitArray(t *testing.T) {
 				0, 0xba}},
 		{bitarray.MakeZeroBitArray(62),
 			[]byte{0x3a,
-				0x88, //word 0
+				0x88, // word 0
 				0, 0xc6}},
 		{bitarray.Not(bitarray.MakeZeroBitArray(62)),
 			[]byte{0x3a,
@@ -960,8 +957,8 @@ func TestKeyEncodeDecodeBitArrayRand(t *testing.T) {
 				buf = EncodeBitArrayAscending(nil, test)
 				remainder, x, err = DecodeBitArrayAscending(buf)
 			} else {
-				buf = EncodeBitArrayAscending(nil, test)
-				remainder, x, err = DecodeBitArrayAscending(buf)
+				buf = EncodeBitArrayDescending(nil, test)
+				remainder, x, err = DecodeBitArrayDescending(buf)
 			}
 			if err != nil {
 				t.Fatalf("%+v", err)
@@ -2619,6 +2616,41 @@ func TestPrettyPrintValueEncoded(t *testing.T) {
 		if str != test.expected {
 			t.Errorf("%d: got %q expected %q", i, str, test.expected)
 		}
+	}
+}
+
+func TestUnsafeConvertStringToBytes(t *testing.T) {
+	// Large input runs slowly.
+	skip.UnderStress(t)
+
+	testCases := []struct {
+		desc           string
+		input          string
+		expectNil      bool
+		expectedLength int
+	}{
+		{
+			desc:      "empty",
+			input:     "",
+			expectNil: true,
+		},
+		{
+			// Previous impl could not handle strings longer than math.MaxInt32.
+			// See https://github.com/cockroachdb/cockroach/issues/111626
+			desc:           "large input",
+			input:          string(make([]byte, math.MaxInt32+1)),
+			expectedLength: math.MaxInt32 + 1,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			actual := UnsafeConvertStringToBytes(tc.input)
+			if tc.expectNil {
+				require.Nil(t, actual)
+			} else {
+				require.Equal(t, len(actual), tc.expectedLength)
+			}
+		})
 	}
 }
 

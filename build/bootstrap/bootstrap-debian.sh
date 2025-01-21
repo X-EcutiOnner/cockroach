@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+
+# Copyright 2017 The Cockroach Authors.
+#
+# Use of this software is governed by the CockroachDB Software License
+# included in the /LICENSE file.
+
 #
 # On a Debian/Ubuntu system, bootstraps a docker install and the cockroach
 # repo.
@@ -35,7 +41,7 @@ echo '. ~/.bashrc_bootstrap' >> ~/.bashrc
 
 # Upgrade cmake.
 trap 'rm -f /tmp/cmake.tgz' EXIT
-curl -fsSL https://github.com/Kitware/CMake/releases/download/v3.20.3/cmake-3.20.3-Linux-x86_64.tar.gz > /tmp/cmake.tgz
+curl -fsSL https://github.com/Kitware/CMake/releases/download/v3.20.3/cmake-3.20.3-Linux-x86_64.tar.gz >/tmp/cmake.tgz
 sha256sum -c - <<EOF
 97bf730372f9900b2dfb9206fccbcf92f5c7f3b502148b832e77451aa0f9e0e6  /tmp/cmake.tgz
 EOF
@@ -43,9 +49,9 @@ sudo tar -C /usr --strip-components=1 -zxf /tmp/cmake.tgz && rm /tmp/cmake.tgz
 
 # Install Go.
 trap 'rm -f /tmp/go.tgz' EXIT
-curl -fsSL https://dl.google.com/go/go1.19.10.linux-amd64.tar.gz > /tmp/go.tgz
+curl -fsSL https://dl.google.com/go/go1.22.8.linux-amd64.tar.gz >/tmp/go.tgz
 sha256sum -c - <<EOF
-8b045a483d3895c6edba2e90a9189262876190dbbd21756870cdd63821810677  /tmp/go.tgz
+5f467d29fc67c7ae6468cb6ad5b047a274bae8180cac5e0b7ddbfeba3e47e18f  /tmp/go.tgz
 EOF
 sudo tar -C /usr/local -zxf /tmp/go.tgz && rm /tmp/go.tgz
 
@@ -61,7 +67,6 @@ curl -fsSL https://github.com/bazelbuild/bazelisk/releases/download/v1.10.1/baze
 echo '4cb534c52cdd47a6223d4596d530e7c9c785438ab3b0a49ff347e991c210b2cd /tmp/bazelisk' | sha256sum -c -
 chmod +x /tmp/bazelisk
 sudo mv /tmp/bazelisk /usr/bin/bazel
-echo "build --config=dev" > ~/.bazelrc
 
 # Install the Unison file-syncer.
 . bootstrap/bootstrap-unison.sh

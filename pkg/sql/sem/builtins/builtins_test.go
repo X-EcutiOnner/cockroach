@@ -1,17 +1,13 @@
 // Copyright 2016 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package builtins
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"fmt"
 	"math"
@@ -39,7 +35,6 @@ import (
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/constraints"
 )
 
 func TestCategory(t *testing.T) {
@@ -84,7 +79,7 @@ func TestGenerateUniqueIDOrder(t *testing.T) {
 
 // sorterWithSwapCount implements sort.Interface and wraps a slice of data
 // with a counter that tracks the number of swaps performed during sorting.
-type sorterWithSwapCount[T constraints.Ordered] struct {
+type sorterWithSwapCount[T cmp.Ordered] struct {
 	data      []T
 	swapCount int
 }
@@ -241,6 +236,7 @@ func TestSerialNormalizationWithUniqueUnorderedID(t *testing.T) {
 
 	skip.UnderRace(t, "the test is too slow and the goodness of fit test "+
 		"assumes large N")
+	skip.UnderDeadlock(t, "the test is too slow")
 
 	ctx := context.Background()
 
@@ -422,7 +418,9 @@ func TestStringToArrayAndBack(t *testing.T) {
 			}
 
 			evalContext := eval.NewTestingEvalContext(cluster.MakeTestingClusterSettings())
-			if result.Compare(evalContext, expectedArray) != 0 {
+			if cmp, err := result.Compare(context.Background(), evalContext, expectedArray); err != nil {
+				t.Fatal(err)
+			} else if cmp != 0 {
 				t.Errorf("expected %v, got %v", tc.expected, result)
 			}
 
@@ -974,5 +972,33 @@ func TestBitmaskOrAndXor(t *testing.T) {
 		if resultStr != tc.expected {
 			t.Errorf("expected %s, found %s", tc.expected, resultStr)
 		}
+	}
+}
+
+func BenchmarkGenerateID(b *testing.B) {
+	defer log.Scope(b).Close(b)
+
+	ctx := context.Background()
+	s, sqlDB, _ := serverutils.StartServer(b, base.TestServerArgs{})
+	defer s.Stopper().Stop(ctx)
+
+	db := sqlutils.MakeSQLRunner(sqlDB)
+
+	for _, fn := range []string{
+		"gen_random_uuid",
+		"gen_random_ulid",
+	} {
+		b.Run(fn, func(b *testing.B) {
+			for _, rowCount := range []int{1, 10, 100, 1000} {
+				b.Run(fmt.Sprintf("rows=%d", rowCount), func(b *testing.B) {
+					q := fmt.Sprintf(`select %s() from generate_series(0, %d);`, fn, rowCount)
+					b.ResetTimer()
+					for i := 0; i < b.N; i++ {
+						db.Exec(b, q)
+					}
+					b.StopTimer()
+				})
+			}
+		})
 	}
 }
