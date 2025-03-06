@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package physicalplan
 
@@ -60,7 +55,7 @@ func TestProjectionAndRendering(t *testing.T) {
 			resultTypes: "A,B,C,D",
 
 			action: func(p *PhysicalPlan) {
-				p.AddProjection([]uint32{1, 3, 2}, execinfrapb.Ordering{})
+				p.AddProjection([]uint32{1, 3, 2}, execinfrapb.Ordering{}, nil /* finalizeLastStageCb */)
 			},
 
 			expPost: execinfrapb.PostProcessSpec{
@@ -74,7 +69,7 @@ func TestProjectionAndRendering(t *testing.T) {
 			resultTypes: "A,B,C,D",
 
 			action: func(p *PhysicalPlan) {
-				p.AddProjection([]uint32{2}, execinfrapb.Ordering{})
+				p.AddProjection([]uint32{2}, execinfrapb.Ordering{}, nil /* finalizeLastStageCb */)
 			},
 
 			expPost: execinfrapb.PostProcessSpec{
@@ -93,7 +88,7 @@ func TestProjectionAndRendering(t *testing.T) {
 			resultTypes: "A,B,C,D",
 
 			action: func(p *PhysicalPlan) {
-				p.AddProjection([]uint32{3, 1}, execinfrapb.Ordering{})
+				p.AddProjection([]uint32{3, 1}, execinfrapb.Ordering{}, nil /* finalizeLastStageCb */)
 			},
 
 			expPost: execinfrapb.PostProcessSpec{
@@ -112,7 +107,7 @@ func TestProjectionAndRendering(t *testing.T) {
 
 			// Every render expression is used.
 			action: func(p *PhysicalPlan) {
-				p.AddProjection([]uint32{2, 0, 1}, execinfrapb.Ordering{})
+				p.AddProjection([]uint32{2, 0, 1}, execinfrapb.Ordering{}, nil /* finalizeLastStageCb */)
 			},
 
 			expPost: execinfrapb.PostProcessSpec{
@@ -129,7 +124,7 @@ func TestProjectionAndRendering(t *testing.T) {
 			// Some render expressions aren't used which adds another processor
 			// stage.
 			action: func(p *PhysicalPlan) {
-				p.AddProjection([]uint32{2, 0}, execinfrapb.Ordering{})
+				p.AddProjection([]uint32{2, 0}, execinfrapb.Ordering{}, nil /* finalizeLastStageCb */)
 			},
 
 			expPrevPost: &execinfrapb.PostProcessSpec{
@@ -160,6 +155,7 @@ func TestProjectionAndRendering(t *testing.T) {
 					[]int{-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3},
 					[]*types.T{strToType("A"), strToType("B"), strToType("C"), strToType("D")},
 					execinfrapb.Ordering{},
+					nil, /* finalizeLastStageCb */
 				); err != nil {
 					t.Fatal(err)
 				}
@@ -186,6 +182,7 @@ func TestProjectionAndRendering(t *testing.T) {
 					[]int{-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3},
 					[]*types.T{strToType("B"), strToType("D"), strToType("C")},
 					execinfrapb.Ordering{},
+					nil, /* finalizeLastStageCb */
 				); err != nil {
 					t.Fatal(err)
 				}
@@ -218,6 +215,7 @@ func TestProjectionAndRendering(t *testing.T) {
 					[]int{2, 0, 3, 1},
 					[]*types.T{strToType("C"), strToType("A"), strToType("D")},
 					execinfrapb.Ordering{},
+					nil, /* finalizeLastStageCb */
 				); err != nil {
 					t.Fatal(err)
 				}

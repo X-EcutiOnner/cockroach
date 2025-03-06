@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package kvtenant
 
@@ -18,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/config"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
@@ -27,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -36,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
@@ -126,8 +120,8 @@ func (*mockServer) Batch(context.Context, *kvpb.BatchRequest) (*kvpb.BatchRespon
 	panic("unimplemented")
 }
 
-func (*mockServer) RangeFeed(*kvpb.RangeFeedRequest, kvpb.Internal_RangeFeedServer) error {
-	panic("unimplemented")
+func (m *mockServer) BatchStream(stream kvpb.Internal_BatchStreamServer) error {
+	panic("implement me")
 }
 
 func (m *mockServer) MuxRangeFeed(server kvpb.Internal_MuxRangeFeedServer) error {
@@ -206,18 +200,6 @@ func gossipEventForStoreDesc(desc *roachpb.StoreDescriptor) *kvpb.GossipSubscrip
 	}
 }
 
-func gossipEventForSystemConfig(cfg *config.SystemConfigEntries) *kvpb.GossipSubscriptionEvent {
-	val, err := protoutil.Marshal(cfg)
-	if err != nil {
-		panic(err)
-	}
-	return &kvpb.GossipSubscriptionEvent{
-		Key:            gossip.KeyDeprecatedSystemConfig,
-		Content:        roachpb.MakeValueFromBytesAndTimestamp(val, hlc.Timestamp{}),
-		PatternMatched: gossip.KeyDeprecatedSystemConfig,
-	}
-}
-
 func waitForNodeDesc(t *testing.T, c *connector, nodeID roachpb.NodeID) {
 	t.Helper()
 	testutils.SucceedsSoon(t, func() error {
@@ -239,7 +221,7 @@ func newConnector(cfg ConnectorConfig, addrs []string) *connector {
 }
 
 // TestConnectorGossipSubscription tests connector's roles as a
-// kvcoord.NodeDescStore and as a config.SystemConfigProvider.
+// kvclient.NodeDescStore.
 func TestConnectorGossipSubscription(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -249,7 +231,7 @@ func TestConnectorGossipSubscription(t *testing.T) {
 	defer stopper.Stop(ctx)
 	clock := hlc.NewClockForTesting(nil)
 	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
-	s, err := rpc.NewServer(rpcContext)
+	s, err := rpc.NewServer(ctx, rpcContext)
 	require.NoError(t, err)
 
 	// Test setting the cluster ID by setting it to nil then ensuring it's later
@@ -260,11 +242,10 @@ func TestConnectorGossipSubscription(t *testing.T) {
 	gossipSubC := make(chan *kvpb.GossipSubscriptionEvent)
 	defer close(gossipSubC)
 	gossipSubFn := func(req *kvpb.GossipSubscriptionRequest, stream kvpb.Internal_GossipSubscriptionServer) error {
-		assert.Len(t, req.Patterns, 4)
+		assert.Len(t, req.Patterns, 3)
 		assert.Equal(t, "cluster-id", req.Patterns[0])
 		assert.Equal(t, "node:.*", req.Patterns[1])
 		assert.Equal(t, "store:.*", req.Patterns[2])
-		assert.Equal(t, "system-db", req.Patterns[3])
 		for gossipSub := range gossipSubC {
 			if err := stream.Send(gossipSub); err != nil {
 				return err
@@ -311,7 +292,7 @@ func TestConnectorGossipSubscription(t *testing.T) {
 	// Ensure that ClusterID was updated.
 	require.Equal(t, clusterID, rpcContext.StorageClusterID.Get())
 
-	// Test kvcoord.NodeDescStore impl. Wait for full update first.
+	// Test kvclient.NodeDescStore impl. Wait for full update first.
 	waitForNodeDesc(t, c, 2)
 	desc, err := c.GetNodeDescriptor(1)
 	require.Equal(t, node1, desc)
@@ -321,7 +302,7 @@ func TestConnectorGossipSubscription(t *testing.T) {
 	require.NoError(t, err)
 	desc, err = c.GetNodeDescriptor(3)
 	require.Nil(t, desc)
-	require.Regexp(t, "unable to look up descriptor for n3", err)
+	require.Regexp(t, "node descriptor with node ID 3 was not found", err)
 
 	// Test GetStoreDescriptor.
 	storeID1 := roachpb.StoreID(1)
@@ -340,7 +321,7 @@ func TestConnectorGossipSubscription(t *testing.T) {
 	require.Equal(t, store2, storeDesc)
 	storeDesc, err = c.GetStoreDescriptor(3)
 	require.Nil(t, storeDesc)
-	require.Regexp(t, "unable to look up descriptor for store ID 3", err)
+	require.Regexp(t, "store descriptor with store ID 3 was not found", err)
 
 	// Return updated GossipSubscription response.
 	node1Up := &roachpb.NodeDescriptor{NodeID: 1, Address: util.MakeUnresolvedAddr("tcp", "1.2.3.4")}
@@ -348,7 +329,7 @@ func TestConnectorGossipSubscription(t *testing.T) {
 	gossipSubC <- gossipEventForNodeDesc(node1Up)
 	gossipSubC <- gossipEventForNodeDesc(node3)
 
-	// Test kvcoord.NodeDescStore impl. Wait for full update first.
+	// Test kvclient.NodeDescStore impl. Wait for full update first.
 	waitForNodeDesc(t, c, 3)
 	desc, err = c.GetNodeDescriptor(1)
 	require.Equal(t, node1Up, desc)
@@ -359,42 +340,6 @@ func TestConnectorGossipSubscription(t *testing.T) {
 	desc, err = c.GetNodeDescriptor(3)
 	require.Equal(t, node3, desc)
 	require.NoError(t, err)
-
-	// Test config.SystemConfigProvider impl. Should not have a SystemConfig yet.
-	sysCfg := c.GetSystemConfig()
-	require.Nil(t, sysCfg)
-	sysCfgC, _ := c.RegisterSystemConfigChannel()
-	require.Len(t, sysCfgC, 0)
-
-	// Return first SystemConfig response.
-	sysCfgEntries := &config.SystemConfigEntries{Values: []roachpb.KeyValue{
-		{Key: roachpb.Key("a")},
-		{Key: roachpb.Key("b")},
-	}}
-	gossipSubC <- gossipEventForSystemConfig(sysCfgEntries)
-
-	// Test config.SystemConfigProvider impl. Wait for update first.
-	<-sysCfgC
-	sysCfg = c.GetSystemConfig()
-	require.NotNil(t, sysCfg)
-	require.Equal(t, sysCfgEntries.Values, sysCfg.Values)
-
-	// Return updated SystemConfig response.
-	sysCfgEntriesUp := &config.SystemConfigEntries{Values: []roachpb.KeyValue{
-		{Key: roachpb.Key("a")},
-		{Key: roachpb.Key("c")},
-	}}
-	gossipSubC <- gossipEventForSystemConfig(sysCfgEntriesUp)
-
-	// Test config.SystemConfigProvider impl. Wait for update first.
-	<-sysCfgC
-	sysCfg = c.GetSystemConfig()
-	require.NotNil(t, sysCfg)
-	require.Equal(t, sysCfgEntriesUp.Values, sysCfg.Values)
-
-	// A newly registered SystemConfig channel will be immediately notified.
-	sysCfgC2, _ := c.RegisterSystemConfigChannel()
-	require.Len(t, sysCfgC2, 1)
 }
 
 // TestConnectorGossipSubscription tests connector's role as a
@@ -408,7 +353,7 @@ func TestConnectorRangeLookup(t *testing.T) {
 	defer stopper.Stop(ctx)
 	clock := hlc.NewClockForTesting(nil)
 	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
-	s, err := rpc.NewServer(rpcContext)
+	s, err := rpc.NewServer(ctx, rpcContext)
 	require.NoError(t, err)
 
 	rangeLookupRespC := make(chan *kvpb.RangeLookupResponse, 1)
@@ -474,12 +419,6 @@ func TestConnectorRangeLookup(t *testing.T) {
 	require.Nil(t, resDescs)
 	require.Nil(t, resPreDescs)
 	require.Regexp(t, context.Canceled.Error(), err)
-
-	// FirstRange always returns error.
-	desc, err := c.FirstRange()
-	require.Nil(t, desc)
-	require.Regexp(t, "does not have access to FirstRange", err)
-	require.True(t, grpcutil.IsAuthError(err))
 }
 
 // TestConnectorRetriesUnreachable tests that connector iterates over each of
@@ -495,7 +434,7 @@ func TestConnectorRetriesUnreachable(t *testing.T) {
 
 	clock := hlc.NewClockForTesting(nil)
 	rpcContext := rpc.NewInsecureTestingContext(ctx, clock, stopper)
-	s, err := rpc.NewServer(rpcContext)
+	s, err := rpc.NewServer(ctx, rpcContext)
 	require.NoError(t, err)
 
 	node1 := &roachpb.NodeDescriptor{NodeID: 1, Address: util.MakeUnresolvedAddr("tcp", "1.1.1.1")}
@@ -506,11 +445,10 @@ func TestConnectorRetriesUnreachable(t *testing.T) {
 		gossipEventForNodeDesc(node2),
 	}
 	gossipSubFn := func(req *kvpb.GossipSubscriptionRequest, stream kvpb.Internal_GossipSubscriptionServer) error {
-		assert.Len(t, req.Patterns, 4)
+		assert.Len(t, req.Patterns, 3)
 		assert.Equal(t, "cluster-id", req.Patterns[0])
 		assert.Equal(t, "node:.*", req.Patterns[1])
 		assert.Equal(t, "store:.*", req.Patterns[2])
-		assert.Equal(t, "system-db", req.Patterns[3])
 		for _, event := range gossipSubEvents {
 			if err := stream.Send(event); err != nil {
 				return err
@@ -557,7 +495,7 @@ func TestConnectorRetriesUnreachable(t *testing.T) {
 	})
 	require.NoError(t, <-startedC)
 
-	// Test kvcoord.NodeDescStore impl. Wait for full update first.
+	// Test kvclient.NodeDescStore impl. Wait for full update first.
 	waitForNodeDesc(t, c, 2)
 	desc, err := c.GetNodeDescriptor(1)
 	require.Equal(t, node1, desc)
@@ -567,7 +505,8 @@ func TestConnectorRetriesUnreachable(t *testing.T) {
 	require.NoError(t, err)
 	desc, err = c.GetNodeDescriptor(3)
 	require.Nil(t, desc)
-	require.Regexp(t, "unable to look up descriptor for n3", err)
+	require.True(t, errors.HasType(err, &kvpb.DescNotFoundError{}))
+	require.Regexp(t, "node descriptor with node ID 3 was not found", err)
 }
 
 // TestConnectorRetriesError tests that connector iterates over each of
@@ -592,7 +531,7 @@ func TestConnectorRetriesError(t *testing.T) {
 		gossipSubFn func(req *kvpb.GossipSubscriptionRequest, stream kvpb.Internal_GossipSubscriptionServer) error,
 		rangeLookupFn func(_ context.Context, req *kvpb.RangeLookupRequest) (*kvpb.RangeLookupResponse, error),
 	) string {
-		internalServer, err := rpc.NewServer(rpcContext)
+		internalServer, err := rpc.NewServer(ctx, rpcContext)
 		require.NoError(t, err)
 		kvpb.RegisterInternalServer(internalServer, &mockServer{rangeLookupFn: rangeLookupFn, gossipSubFn: gossipSubFn})
 		ln, err := net.Listen(util.TestAddr.Network(), util.TestAddr.String())

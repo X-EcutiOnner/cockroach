@@ -1,12 +1,7 @@
 // Copyright 2021 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package sql
 
@@ -130,16 +125,17 @@ func (im *IndexBackfillerMergePlanner) plan(
 	mergeTimestamp hlc.Timestamp,
 ) (func(context.Context) error, error) {
 	var p *PhysicalPlan
-	var evalCtx extendedEvalContext
+	var extEvalCtx extendedEvalContext
 	var planCtx *PlanningCtx
 
 	if err := DescsTxn(ctx, im.execCfg, func(
 		ctx context.Context, txn isql.Txn, descriptors *descs.Collection,
 	) error {
 		sd := NewInternalSessionData(ctx, im.execCfg.Settings, "plan-index-backfill-merge")
-		evalCtx = createSchemaChangeEvalCtx(ctx, im.execCfg, sd, txn.KV().ReadTimestamp(), descriptors)
-		planCtx = im.execCfg.DistSQLPlanner.NewPlanningCtx(ctx, &evalCtx, nil /* planner */, txn.KV(),
-			DistributionTypeSystemTenantOnly)
+		extEvalCtx = createSchemaChangeEvalCtx(ctx, im.execCfg, sd, txn.KV().ReadTimestamp(), descriptors)
+		planCtx = im.execCfg.DistSQLPlanner.NewPlanningCtx(
+			ctx, &extEvalCtx, nil /* planner */, txn.KV(), FullDistribution,
+		)
 
 		spec, err := initIndexBackfillMergerSpec(*tableDesc.TableDesc(), addedIndexes, temporaryIndexes, mergeTimestamp)
 		if err != nil {
@@ -160,15 +156,18 @@ func (im *IndexBackfillerMergePlanner) plan(
 			im.execCfg.RangeDescriptorCache,
 			nil, /* txn - the flow does not run wholly in a txn */
 			im.execCfg.Clock,
-			evalCtx.Tracing,
+			extEvalCtx.Tracing,
 		)
 		defer recv.Release()
-		evalCtxCopy := evalCtx
+		// Copy the eval.Context, as dsp.Run() might change it.
+		evalCtxCopy := extEvalCtx.Context.Copy()
 		im.execCfg.DistSQLPlanner.Run(
 			ctx,
 			planCtx,
 			nil, /* txn - the processors manage their own transactions */
-			p, recv, &evalCtxCopy,
+			p,
+			recv,
+			evalCtxCopy,
 			nil, /* finishedSetupFn */
 		)
 		return cbw.Err()
@@ -319,7 +318,7 @@ func (imt *IndexMergeTracker) FlushFractionCompleted(ctx context.Context) error 
 		if err := imt.jobMu.job.NoTxn().FractionProgressed(
 			ctx, jobs.FractionUpdater(frac),
 		); err != nil {
-			return jobs.SimplifyInvalidStatusError(err)
+			return jobs.SimplifyInvalidStateError(err)
 		}
 	}
 	return nil

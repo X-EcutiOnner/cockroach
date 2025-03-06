@@ -1,12 +1,7 @@
 // Copyright 2022 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package admission
 
@@ -15,6 +10,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util/grunning"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 )
 
@@ -22,7 +18,7 @@ import (
 // which the CPU will be considered overloaded, when running in a node that
 // executes KV operations.
 var KVSlotAdjusterOverloadThreshold = settings.RegisterIntSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"admission.kv_slot_adjuster.overload_threshold",
 	"when the number of runnable goroutines per CPU is greater than this threshold, the "+
 		"slot adjuster considers the cpu to be overloaded",
@@ -121,5 +117,7 @@ func (kvsa *kvSlotAdjuster) CPULoad(runnable int, procs int, samplePeriod time.D
 }
 
 func (kvsa *kvSlotAdjuster) isOverloaded() bool {
-	return kvsa.granter.usedSlots >= kvsa.granter.totalSlots && !kvsa.granter.skipSlotEnforcement
+	return kvsa.granter.usedSlots >= kvsa.granter.totalSlots && !kvsa.granter.skipSlotEnforcement &&
+		// See https://github.com/cockroachdb/cockroach/issues/142262.
+		grunning.Supported()
 }

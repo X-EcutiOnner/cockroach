@@ -1,12 +1,7 @@
 // Copyright 2017 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package importer
 
@@ -39,14 +34,14 @@ import (
 )
 
 var replanThreshold = settings.RegisterFloatSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"bulkio.import.replan_flow_threshold",
 	"fraction of initial flow instances that would be added or updated above which an IMPORT is restarted from its last checkpoint (0=disabled)",
 	0.0,
 )
 
 var replanFrequency = settings.RegisterDurationSetting(
-	settings.TenantWritable,
+	settings.ApplicationLevel,
 	"bulkio.import.replan_flow_frequency",
 	"frequency at which IMPORT checks to see if restarting would update its physical execution plan",
 	time.Minute*2,
@@ -109,6 +104,7 @@ func distImport(
 			// The direct-ingest readers will emit a binary encoded BulkOpSummary.
 			[]*types.T{types.Bytes, types.Bytes},
 			execinfrapb.Ordering{},
+			nil, /* finalizeLastStageCb */
 		)
 
 		p.PlanToStreamColMap = []int{0, 1}
@@ -121,7 +117,6 @@ func distImport(
 	if err != nil {
 		return kvpb.BulkOpSummary{}, err
 	}
-	evalCtx := planCtx.ExtendedEvalCtx
 
 	// accumulatedBulkSummary accumulates the BulkOpSummary returned from each
 	// processor in their progress updates. It stores stats about the amount of
@@ -214,7 +209,7 @@ func distImport(
 		return nil
 	})
 
-	if evalCtx.Codec.ForSystemTenant() {
+	if planCtx.ExtendedEvalCtx.Codec.ForSystemTenant() {
 		if err := presplitTableBoundaries(ctx, execCtx.ExecCfg(), tables); err != nil {
 			return kvpb.BulkOpSummary{}, err
 		}
@@ -227,7 +222,7 @@ func distImport(
 		nil, /* rangeCache */
 		nil, /* txn - the flow does not read or write the database */
 		nil, /* clockUpdater */
-		evalCtx.Tracing,
+		planCtx.ExtendedEvalCtx.Tracing,
 	)
 	defer recv.Release()
 
@@ -272,9 +267,9 @@ func distImport(
 		execCfg := execCtx.ExecCfg()
 		jobsprofiler.StorePlanDiagram(ctx, execCfg.DistSQLSrv.Stopper, p, execCfg.InternalDB, job.ID())
 
-		// Copy the evalCtx, as dsp.Run() might change it.
-		evalCtxCopy := *evalCtx
-		dsp.Run(ctx, planCtx, nil, p, recv, &evalCtxCopy, testingKnobs.onSetupFinish)
+		// Copy the eval.Context, as dsp.Run() might change it.
+		evalCtxCopy := planCtx.ExtendedEvalCtx.Context.Copy()
+		dsp.Run(ctx, planCtx, nil, p, recv, evalCtxCopy, testingKnobs.onSetupFinish)
 		return rowResultWriter.Err()
 	})
 

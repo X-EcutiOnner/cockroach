@@ -1,12 +1,7 @@
 // Copyright 2023 The Cockroach Authors.
 //
-// Use of this software is governed by the Business Source License
-// included in the file licenses/BSL.txt.
-//
-// As of the Change Date specified in that file, in accordance with
-// the Business Source License, use of this software will be governed
-// by the Apache License, Version 2.0, included in the file
-// licenses/APL.txt.
+// Use of this software is governed by the CockroachDB Software License
+// included in the /LICENSE file.
 
 package tests
 
@@ -20,9 +15,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/stretchr/testify/require"
 )
@@ -31,9 +28,11 @@ import (
 func registerProcessLock(r registry.Registry) {
 	const runDuration = 5 * time.Minute
 	r.Add(registry.TestSpec{
-		Name:    "process-lock",
-		Owner:   registry.OwnerStorage,
-		Cluster: r.MakeClusterSpec(4, spec.ReuseNone()),
+		Name:             "process-lock",
+		Owner:            registry.OwnerStorage,
+		Cluster:          r.MakeClusterSpec(4, spec.WorkloadNode(), spec.ReuseNone()),
+		CompatibleClouds: registry.AllExceptAWS,
+		Suites:           registry.Suites(registry.Nightly),
 		// Encryption is implemented within the virtual filesystem layer,
 		// just like disk-health monitoring. It's important to exercise
 		// encryption-at-rest to ensure we don't corrupt the encryption-at-rest
@@ -41,36 +40,36 @@ func registerProcessLock(r registry.Registry) {
 		EncryptionSupport: registry.EncryptionMetamorphic,
 		Leases:            registry.MetamorphicLeases,
 		Timeout:           2 * runDuration,
+		Monitor:           true,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			startOpts := option.DefaultStartOpts()
 			startSettings := install.MakeClusterSettings()
 			startSettings.Env = append(startSettings.Env, "COCKROACH_AUTO_BALLAST=false")
 
 			t.Status("starting cluster")
-			c.Put(ctx, t.Cockroach(), "./cockroach")
-			c.Start(ctx, t.L(), startOpts, startSettings, c.Range(1, 3))
+			c.Start(ctx, t.L(), startOpts, startSettings, c.CRDBNodes())
 
 			// Wait for upreplication.
 			conn := c.Conn(ctx, t.L(), 2)
 			defer conn.Close()
 			require.NoError(t, conn.PingContext(ctx))
-			require.NoError(t, WaitFor3XReplication(ctx, t, conn))
+			require.NoError(t, roachtestutil.WaitFor3XReplication(ctx, t.L(), conn))
 
-			c.Run(ctx, c.Node(4), `./cockroach workload init kv --splits 1000 {pgurl:1}`)
+			c.Run(ctx, option.WithNodes(c.WorkloadNode()), `./cockroach workload init kv --splits 1000 {pgurl:1}`)
 
 			seed := int64(1666467482296309000)
 			rng := randutil.NewTestRandWithSeed(seed)
+			g := t.NewGroup()
 
 			t.Status("starting workload")
-			m := c.NewMonitor(ctx, c.Range(1, 3))
-			m.Go(func(ctx context.Context) error {
-				c.Run(ctx, c.Node(4), fmt.Sprintf(`./cockroach workload run kv --read-percent 0 `+
+			g.Go(func(ctx context.Context, _ *logger.Logger) error {
+				c.Run(ctx, option.WithNodes(c.WorkloadNode()), fmt.Sprintf(`./cockroach workload run kv --read-percent 0 `+
 					`--duration %s --concurrency 512 --max-rate 4096 --tolerate-errors `+
 					` --min-block-bytes=1024 --max-block-bytes=1024 `+
 					`{pgurl:1-3}`, runDuration.String()))
 				return nil
 			})
-			m.Go(func(ctx context.Context) error {
+			g.Go(func(ctx context.Context, l *logger.Logger) error {
 				// Query /proc/ on each of the nodes to retrieve the exact
 				// command used to start the node. This is more future proof
 				// than trying to reconstruct the command deposited into the
@@ -83,7 +82,7 @@ func registerProcessLock(r registry.Registry) {
 					// grepping for `./cockroach start` in ps's output, and
 					// grabbing the first field after stripping leading
 					// whitespace. Then, use this pid cat /proc/<pid>/cmdline.
-					result, err := c.RunWithDetailsSingleNode(ctx, t.L(), c.Node(n),
+					result, err := c.RunWithDetailsSingleNode(ctx, l, option.WithNodes(c.Node(n)),
 						"cat /proc/`ps -eo pid,args | grep -E '([0-9]+) ./cockroach start' |  sed 's/^ *//' | cut -d ' ' -f 1`/cmdline")
 					if err != nil {
 						return err
@@ -110,7 +109,7 @@ func registerProcessLock(r registry.Registry) {
 						}
 					}
 					startCommands[n-1] = cmd.String()
-					t.L().PrintfCtx(ctx, "Retrieved n%d's start command: %s", n, startCommands[n-1])
+					l.PrintfCtx(ctx, "Retrieved n%d's start command: %s", n, startCommands[n-1])
 				}
 
 				done := time.After(runDuration)
@@ -130,31 +129,30 @@ func registerProcessLock(r registry.Registry) {
 						ops := []func(){
 							func() {
 								// Try to start the node again.
-								err := c.RunE(ctx, c.Node(n), startCommands[n-1])
-								t.L().PrintfCtx(ctx, "Attempt to start cockroach process on n%d while another cockroach process is still running; error expected: %v", n, err)
+								err := c.RunE(ctx, option.WithNodes(c.Node(n)), startCommands[n-1])
+								l.PrintfCtx(ctx, "Attempt to start cockroach process on n%d while another cockroach process is still running; error expected: %v", n, err)
 							},
 							func() {
 								// Try to perform a manual compaction.
-								err := c.RunE(ctx, c.Node(n), fmt.Sprintf("./cockroach debug compact /mnt/data1/cockroach %s", enterpriseEncryption[n-1]))
-								t.L().PrintfCtx(ctx, "Attempt to manual compact store on n%d while another cockroach process is still running; error expected: %v", n, err)
+								err := c.RunE(ctx, option.WithNodes(c.Node(n)), fmt.Sprintf("./cockroach debug compact /mnt/data1/cockroach %s", enterpriseEncryption[n-1]))
+								l.PrintfCtx(ctx, "Attempt to manual compact store on n%d while another cockroach process is still running; error expected: %v", n, err)
 							},
 							func() {
 								// Restart the node. This verifies that the
 								// other operations that were performed
 								// concurrently with the running process did not
 								// corrupt the on-disk state.
-								m.ExpectDeath()
-								c.Stop(ctx, t.L(), option.DefaultStopOpts(), c.Node(n))
-								c.Start(ctx, t.L(), startOpts, startSettings, c.Node(n))
-								m.ResetDeaths()
+								t.Monitor().ExpectDeath()
+								c.Stop(ctx, l, option.DefaultStopOpts(), c.Node(n))
+								c.Start(ctx, l, startOpts, startSettings, c.Node(n))
+								t.Monitor().ResetDeaths()
 							},
 						}
 						ops[randutil.RandIntInRange(rng, 0, len(ops))]()
 					}
 				}
 			})
-
-			m.Wait()
+			g.Wait()
 		},
 	})
 }
