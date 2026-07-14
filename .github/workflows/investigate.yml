@@ -4,6 +4,17 @@
 # issue. Invokes Claude to autonomously analyze the failure and post
 # findings as a comment.
 #
+# Model selection: the first words after `/investigate` pick the model
+# and the reasoning effort:
+#
+#   /investigate                Opus 4.6 at high effort (the default)
+#   /investigate sonnet         Sonnet 5 (cheaper)
+#   /investigate fable          Claude Fable 5 (most capable, 2x Opus price)
+#   /investigate fable xhigh    ...at raised reasoning effort
+#
+# Effort is one of low, medium, high (default), xhigh, max. Opus 4.6
+# does not support xhigh (it is silently downgraded to high).
+#
 # Manual testing via workflow_dispatch:
 #
 #   Changes to this workflow (especially to permissions, allowed tools,
@@ -40,13 +51,14 @@
 #
 #        git push <your-fork-remote> <failure-sha>:refs/heads/investigate-sha
 #
-#   4. Trigger the workflow. Dispatch defaults to a cheaper model
-#      (Sonnet 4.5); add -f cheap=false for Opus 4.6:
+#   4. Trigger the workflow. Dispatch defaults to Opus 4.6 at high
+#      effort; pass a trigger comment to pick another model or effort:
 #
 #        gh workflow run investigate.yml \
 #          --repo <you>/cockroach \
 #          --ref agent-workflow-investigate \
-#          -f issue_number=<fork-issue-number>
+#          -f issue_number=<fork-issue-number> \
+#          -f comment_body='/investigate sonnet xhigh'
 
 name: Investigate Test Failure
 
@@ -59,12 +71,8 @@ on:
         description: 'Issue number to investigate'
         required: true
       comment_body:
-        description: 'Simulated trigger comment'
+        description: 'Simulated trigger comment (selects model and effort)'
         default: '/investigate'
-      cheap:
-        description: 'Use a cheaper model (claude-sonnet-4-5)'
-        type: boolean
-        default: true
       smoke_test:
         description: 'Run a tool smoke test instead of a real investigation'
         type: boolean
@@ -259,6 +267,44 @@ jobs:
             rm -rf "$CERT_DIR"
           fi
 
+      # Model and effort selection from the trigger comment (see the
+      # header comment for the syntax). Only the second and third word
+      # of the comment's first line are considered, and unrecognized
+      # words are ignored, so trailing free text in the comment is
+      # harmless. The comment body is read from the environment rather
+      # than interpolated into the script, so comment content cannot
+      # inject shell.
+      - name: Select model
+        run: |
+          model='claude-opus-4-6'
+          effort='high'
+          arg1=$(printf '%s' "$COMMENT_BODY" | head -n1 | awk '{print tolower($2)}')
+          arg2=$(printf '%s' "$COMMENT_BODY" | head -n1 | awk '{print tolower($3)}')
+          for arg in "$arg1" "$arg2"; do
+            case "$arg" in
+              sonnet|sonnet-5) model='claude-sonnet-5' ;;
+              fable|fable-5)   model='claude-fable-5' ;;
+              low|medium|high|xhigh|max) effort="$arg" ;;
+            esac
+          done
+          # Opus 4.6 predates the xhigh effort level.
+          if [ "$model" = 'claude-opus-4-6' ] && [ "$effort" = 'xhigh' ]; then
+            effort='high'
+          fi
+          echo "Selected model: $model, effort: $effort"
+          echo "CLAUDE_MODEL=$model" >> "$GITHUB_ENV"
+          echo "CLAUDE_EFFORT=$effort" >> "$GITHUB_ENV"
+
+      # claude-code-action@v1 would install Claude Code 1.0.127
+      # (Sep 2025), which predates the --effort flag (the CLI errors on
+      # unknown options) as well as the Sonnet 5 and Fable 5 models.
+      # Install a pinned recent version instead and hand it to the
+      # action via path_to_claude_code_executable below.
+      - name: Install Claude Code
+        run: |
+          curl -fsSL https://claude.ai/install.sh | bash -s 2.1.209
+          echo "CLAUDE_BIN=$HOME/.local/bin/claude" >> "$GITHUB_ENV"
+
       - name: Investigate
         id: investigate
         uses: cockroachdb/claude-code-action@v1
@@ -272,6 +318,7 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           use_vertex: ${{ env.HAS_API_KEY != 'true' && 'true' || 'false' }}
+          path_to_claude_code_executable: ${{ env.CLAUDE_BIN }}
           # Permissions are passed via --allowedTools using the colon
           # format (Bash(cmd:args)) because cockroachdb/claude-code-action@v1
           # (Claude Code 2.0.1) ignores permissions set via the `settings`
@@ -279,7 +326,8 @@ jobs:
           # correctly. The newer space format (Bash(cmd args)) and settings-
           # based permissions may work after upgrading the action.
           claude_args: |
-            --model ${{ inputs.cheap == true && 'claude-sonnet-4-5' || 'claude-opus-4-6' }}
+            --model ${{ env.CLAUDE_MODEL }}
+            --effort ${{ env.CLAUDE_EFFORT }}
             --allowedTools "Write,Read,Grep,Glob,WebFetch,Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(grep:*),Bash(rg:*),Bash(awk:*),Bash(cut:*),Bash(tr:*),Bash(sort:*),Bash(uniq:*),Bash(wc:*),Bash(tee:*),Bash(diff:*),Bash(file:*),Bash(strings:*),Bash(jq:*),Bash(ls:*),Bash(find:*),Bash(tree:*),Bash(stat:*),Bash(du:*),Bash(mkdir:*),Bash(git:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh pr diff:*),Bash(gh search:*),Bash(fetch-url:*),Bash(unzip:*),Bash(tar x*),Bash(tar -x*),Bash(tar --extract:*),Bash(go mod download:*),Bash(go env:*),Bash(.claude/skills/engflow-artifacts/run.sh:*),Bash(go tool pprof:*),Bash(go run ./pkg/cmd/tsdump2duck:*),Bash(duckdb:*)"
           prompt: |
             Read and follow the instructions in the prompt file
@@ -356,13 +404,22 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # Empty if the job failed before the Select model step.
+          : "${CLAUDE_MODEL:=unknown}" "${CLAUDE_EFFORT:=unknown}"
+          # Footer identifying the model, plus a pointer at the deeper
+          # settings (omitted when this run already used them).
+          hint=''
+          if [ "$CLAUDE_MODEL" != 'claude-fable-5' ] || [ "$CLAUDE_EFFORT" != 'max' ]; then
+            hint=' Use `/investigate fable-5 (high|xhigh|max)` to go deeper.'
+          fi
           if [ -s artifacts/findings.md ]; then
-            # Append the run link and feedback footer here rather than asking
-            # the agent to write them, so the prompt never has to describe the
-            # report as a posted comment (which tempted it to post directly).
+            # Append the footers here rather than asking the agent to write
+            # them, so the prompt never has to describe the report as a
+            # posted comment (which tempted it to post directly).
             {
               cat artifacts/findings.md
-              printf '\n\n---\n\n'
+              printf '\n\n---\n*Generated by `%s` at `%s` effort.%s*\n\n' \
+                "$CLAUDE_MODEL" "$CLAUDE_EFFORT" "$hint"
               printf '[Workflow run](%s) · Was this investigation helpful? Leave a 👍 or 👎 on this comment.\n' "$run_url"
             } > "${RUNNER_TEMP:-/tmp}/comment_body.md"
             gh issue comment "$ISSUE_NUMBER" \
@@ -371,7 +428,7 @@ jobs:
           else
             gh issue comment "$ISSUE_NUMBER" \
               --repo ${{ github.repository }} \
-              --body "Investigation did not produce findings. Check the [workflow run]($run_url) for details."
+              --body "Investigation (model \`$CLAUDE_MODEL\`, effort \`$CLAUDE_EFFORT\`) did not produce findings. Check the [workflow run]($run_url) for details."
           fi
 
       - name: Clean up EngFlow certificates
