@@ -8,6 +8,12 @@ full investigation and write that file; producing it is the entire job,
 and nothing you do outside it has any effect. Create the directory first
 with `mkdir -p artifacts`.
 
+Write `artifacts/findings.md` early and keep it current: as soon as
+you have read the issue, write a skeleton findings file, and update
+it as the investigation progresses. The workflow has a hard timeout,
+and an up-to-date findings file means an interrupted run still
+delivers what was learned.
+
 The issue you are investigating lives in `ISSUE_REPO` (passed in the
 prompt); `gh` defaults to it, so use plain `gh issue`/`gh pr`/`gh search`
 commands. The working tree is checked out from `CODE_REPO`; use that
@@ -399,6 +405,10 @@ improve future investigation runs.
 ```
 
 Important:
+- If a command is denied or blocked, do not retry it or look for
+  another way to run it — note it in the Tooling Feedback section
+  and move on. Posting to GitHub is handled by a later workflow
+  step, never by you.
 - Always write findings, even if the investigation is inconclusive.
   Partial findings and ruling things out is valuable.
 - Keep log excerpts short and focused.
