@@ -291,7 +291,9 @@ jobs:
               low|medium|high|xhigh|max) effort="$arg" ;;
             esac
           done
-          # Opus 4.6 predates the xhigh effort level.
+          # Opus 4.6 predates the xhigh effort level; max, in contrast,
+          # is supported on Opus 4.6 (xhigh arrived later, slotted
+          # between high and max), so only xhigh is downgraded.
           if [ "$model" = 'claude-opus-4-6' ] && [ "$effort" = 'xhigh' ]; then
             effort='high'
           fi
@@ -427,10 +429,12 @@ jobs:
           # Empty if the job failed before the Select model step.
           : "${CLAUDE_MODEL:=unknown}" "${CLAUDE_EFFORT:=unknown}"
           # Footer identifying the model, plus a pointer at the deeper
-          # settings (omitted when this run already used them).
+          # settings (omitted when this run already used them). The
+          # suggested setting is strictly deeper than any run that sees
+          # the hint, since fable-5 at max is excluded above.
           hint=''
           if [ "$CLAUDE_MODEL" != 'claude-fable-5' ] || [ "$CLAUDE_EFFORT" != 'max' ]; then
-            hint=' Use `/investigate fable-5 (high|xhigh|max)` to go deeper.'
+            hint=' Use `/investigate fable-5 max` to go deeper.'
           fi
           if [ -s artifacts/findings.md ]; then
             # Append the footers here rather than asking the agent to write
