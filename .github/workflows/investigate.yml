@@ -278,8 +278,12 @@ jobs:
         run: |
           model='claude-opus-4-6'
           effort='high'
-          arg1=$(printf '%s' "$COMMENT_BODY" | head -n1 | awk '{print tolower($2)}')
-          arg2=$(printf '%s' "$COMMENT_BODY" | head -n1 | awk '{print tolower($3)}')
+          # GitHub delivers comment bodies with CRLF line endings; strip the
+          # carriage return so the first line's last word matches the case
+          # arms below.
+          line1=$(printf '%s' "$COMMENT_BODY" | head -n1 | tr -d '\r')
+          arg1=$(printf '%s' "$line1" | awk '{print tolower($2)}')
+          arg2=$(printf '%s' "$line1" | awk '{print tolower($3)}')
           for arg in "$arg1" "$arg2"; do
             case "$arg" in
               sonnet|sonnet-5) model='claude-sonnet-5' ;;
