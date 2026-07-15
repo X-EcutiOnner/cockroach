@@ -325,6 +325,13 @@ directory with `mkdir -p artifacts` first). Use the structure below.
 The goal is a skimmable overview that a busy engineer can read in
 under a minute, with full details available on expansion.
 
+Do not hard-wrap prose. The file is posted as a GitHub comment, and
+GitHub's comment renderer turns every single newline into a visible
+line break (unlike markdown files, where paragraphs reflow). Write
+each paragraph as one long line and separate paragraphs with blank
+lines; a mid-sentence newline will show up as a ragged break in the
+posted comment.
+
 Use your judgment on what belongs in the visible summary vs. the
 collapsed details. The summary should cover the key hypotheses,
 related issues, and recommendations. The details block is for
