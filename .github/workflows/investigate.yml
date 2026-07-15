@@ -84,10 +84,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event.issue.pull_request == null &&
        (github.event.comment.body == '/investigate' ||
-        startsWith(github.event.comment.body, '/investigate ')) &&
-       (github.event.comment.author_association == 'COLLABORATOR' ||
-        github.event.comment.author_association == 'MEMBER' ||
-        github.event.comment.author_association == 'OWNER'))
+        startsWith(github.event.comment.body, '/investigate ')))
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -101,6 +98,30 @@ jobs:
       # Repository to check out the code from. Issues and comments use github.repository.
       CODE_REPO: ${{ secrets.CODE_REPO }}
     steps:
+      # Authorization cannot live in the job-level `if:` expression because
+      # checking effective permissions requires an API call. The
+      # author_association field available in expressions reports MEMBER only
+      # for users whose org membership is public, so private members would be
+      # rejected as CONTRIBUTOR. workflow_dispatch needs no check: triggering
+      # it already requires write access.
+      - name: Verify commenter has write permissions
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+        run: |
+          PERM=$(gh api "repos/${{ github.repository }}/collaborators/${COMMENTER}/permission" \
+            --jq '.permission' 2>/dev/null || echo "none")
+          case "$PERM" in
+            admin|write)
+              echo "User ${COMMENTER} has ${PERM} permission - authorized to trigger an investigation"
+              ;;
+            *)
+              echo "::error::User ${COMMENTER} does not have write access (permission: ${PERM}). Only collaborators with write access can trigger an investigation."
+              exit 1
+              ;;
+          esac
+
       - name: Acknowledge trigger
         if: github.event_name == 'issue_comment'
         env:
