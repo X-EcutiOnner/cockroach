@@ -350,11 +350,12 @@ func (h *Histogram) CanFilter(
 	// A constant column (constrained to a single value in every span) can filter
 	// the histogram even when an earlier unconstrained column pushes it past the
 	// exact prefix, e.g. crdb_region on a REGIONAL BY ROW table. See Filter.
-	if c.ExtractConstCols(ctx, h.evalCtx).Contains(h.col) {
-		for i := 0; i < constrainedCols; i++ {
-			if c.Columns.Get(i).ID() == h.col {
+	for i := exactPrefix + 1; i < constrainedCols; i++ {
+		if c.Columns.Get(i).ID() == h.col {
+			if c.ExtractConstCols(ctx, h.evalCtx).Contains(h.col) {
 				return i, exactPrefix, true
 			}
+			break
 		}
 	}
 	return 0, exactPrefix, false
