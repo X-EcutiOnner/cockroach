@@ -7,13 +7,12 @@
 # Model selection: the first words after `/investigate` pick the model
 # and the reasoning effort:
 #
-#   /investigate                Opus 4.6 at high effort (the default)
+#   /investigate                Opus 4.8 at high effort (the default)
 #   /investigate sonnet         Sonnet 5 (cheaper)
 #   /investigate fable          Claude Fable 5 (most capable, 2x Opus price)
 #   /investigate fable xhigh    ...at raised reasoning effort
 #
-# Effort is one of low, medium, high (default), xhigh, max. Opus 4.6
-# does not support xhigh (it is silently downgraded to high).
+# Effort is one of low, medium, high (default), xhigh, max.
 #
 # Manual testing via workflow_dispatch:
 #
@@ -51,7 +50,7 @@
 #
 #        git push <your-fork-remote> <failure-sha>:refs/heads/investigate-sha
 #
-#   4. Trigger the workflow. Dispatch defaults to Opus 4.6 at high
+#   4. Trigger the workflow. Dispatch defaults to Opus 4.8 at high
 #      effort; pass a trigger comment to pick another model or effort:
 #
 #        gh workflow run investigate.yml \
@@ -297,7 +296,7 @@ jobs:
       # inject shell.
       - name: Select model
         run: |
-          model='claude-opus-4-6'
+          model='claude-opus-4-8'
           effort='high'
           # GitHub delivers comment bodies with CRLF line endings; strip the
           # carriage return so the first line's last word matches the case
@@ -312,12 +311,6 @@ jobs:
               low|medium|high|xhigh|max) effort="$arg" ;;
             esac
           done
-          # Opus 4.6 predates the xhigh effort level; max, in contrast,
-          # is supported on Opus 4.6 (xhigh arrived later, slotted
-          # between high and max), so only xhigh is downgraded.
-          if [ "$model" = 'claude-opus-4-6' ] && [ "$effort" = 'xhigh' ]; then
-            effort='high'
-          fi
           echo "Selected model: $model, effort: $effort"
           echo "CLAUDE_MODEL=$model" >> "$GITHUB_ENV"
           echo "CLAUDE_EFFORT=$effort" >> "$GITHUB_ENV"
@@ -334,7 +327,7 @@ jobs:
 
       - name: Investigate
         id: investigate
-        uses: cockroachdb/claude-code-action@v1
+        uses: cockroachdb/claude-code-action@fa7e2f0a29a126f0b81cdcf360561b36e44cf608 # v1.0.180
         env:
           ANTHROPIC_VERTEX_PROJECT_ID: ${{ env.HAS_API_KEY != 'true' && 'vertex-model-runners' || '' }}
           CLOUD_ML_REGION: ${{ env.HAS_API_KEY != 'true' && 'global' || '' }}
